@@ -1529,7 +1529,7 @@ static struct mtd_partition normal_partition_info[] = {
     {
         .name = "userdata",
         .offset = 1152*SZ_1M+40*SZ_1M,
-        .size = 2304*SZ_1M,
+        .size = 2304ULL*SZ_1M,
     },
 {
         .name = "NFTL_Part",

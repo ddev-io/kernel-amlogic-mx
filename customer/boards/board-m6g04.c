@@ -47,6 +47,8 @@
 #include <linux/spi/flash.h>
 #include <linux/i2c.h>
 #include <linux/delay.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 #include <linux/clk.h>
 #include <linux/syscore_ops.h>
 #include <asm/mach-types.h>
@@ -376,7 +378,7 @@ static struct regulator_consumer_supply buck3_data[] = {
     },
 };
 
-static struct axp_cfg_info axp_cfg = {
+static struct battery_parameter board_battery = {
     .pmu_twi_id = 2,		//AXP20_I2CBUS
     .pmu_irq_id = INT_WATCHDOG,
     .pmu_twi_addr = AXP20_ADDR,
@@ -569,11 +571,20 @@ static struct axp_funcdev_info axp_regldevs[] = {
     },
 };
 
+static int g04_pmu_call_back(void *para)
+{
+    return 0;
+}
+
 static struct axp_supply_init_data axp_sply_init_data = {
-	/*
-	 * if you have board specific call functions, add them here
-	 */
-	//.led_control = led_control,
+    /*
+     * if you have board specific call functions, add them here
+     */
+    //.led_control = led_control,
+    .soft_limit_to99 = 0,
+    .para = NULL,
+    .pmu_call_back = g04_pmu_call_back,
+    .board_battery = &board_battery,
 };
 
 static struct axp_funcdev_info axp_splydev[]={
@@ -638,7 +649,6 @@ static struct axp_platform_data axp_pdata = {
     .sply_devs = axp_splydev,
     .gpio_devs = axp_gpiodev,
     .gpio_base = 0,
-    .axp_cfg = &axp_cfg,
 };
 
 #endif
@@ -1212,6 +1222,90 @@ static struct pixcir_i2c_ts_platform_data pixcir_pdata = {
 #endif
 
 
+#ifdef CONFIG_GOODIX_GT82X_CAPACITIVE_TOUCHSCREEN
+#include <linux/ctp.h>
+#define GT82X_IRQ INT_GPIO_0
+#define GT82X_XRES 1280
+#define GT82X_YRES 800
+static void m6ref_set_vccx2(int power_on);
+
+static int gt82x_init_irq(void)
+{
+    gpio_set_status(PAD_GPIOA_16, gpio_status_in);
+    gpio_irq_set(170, GPIO_IRQ(GT82X_IRQ-INT_GPIO_0, GPIO_IRQ_FALLING));
+    return 0;
+}
+
+static u8 gt82x_config[] = {
+    0x0F,0x80,
+    0x1C,0x0D,0x1B,0x0C,0x1A,0x0B,0x19,0x0A,
+    0x18,0x09,0x17,0x08,0x16,0x07,0x15,0x06,
+    0x14,0x05,0x13,0x04,0x12,0x03,0x11,0x02,
+    0x10,0x01,0x0F,0x00,0xFF,0x1D,0x13,0x09,
+    0x12,0x08,0x11,0x07,0x10,0x06,0x0F,0x05,
+    0x0E,0x04,0x0D,0x03,0x0C,0x02,0xFF,0x01,
+    0x0B,0x00,0x0B,0x03,0x88,0x00,0x00,0x19,
+    0x00,0x00,0x03,0x00,0x00,0x0E,0x50,0x3C,
+    0x15,0x03,0x00,0x05,0x00,GT82X_XRES>>8,GT82X_XRES&0xff,GT82X_YRES>>8,
+    GT82X_YRES&0xff,0x1B,0x1A,0x2E,0x2C,0x08,0x00,0x03,
+    0x19,0x05,0x14,0x10,0x00,0x07,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01
+};
+
+static struct ctp_platform_data gt82x_data = {
+    .irq_flag = IRQF_TRIGGER_RISING,
+    .irq = GT82X_IRQ,
+    .init_irq = gt82x_init_irq,
+    .data = gt82x_config,
+    .data_len = ARRAY_SIZE(gt82x_config),
+    .gpio_interrupt = PAD_GPIOA_16,
+    .gpio_power = PAD_GPIOA_23,
+    .gpio_reset = PAD_GPIOC_3,
+    .gpio_enable = 0,
+    .xmin = 0,
+    .xmax = GT82X_XRES,
+    .ymin = 0,
+    .ymax = GT82X_YRES,
+};
+
+static struct i2c_board_info gt82x_i2c_info = {
+    I2C_BOARD_INFO("Goodix-TS", 0x5d),
+    .irq = GT82X_IRQ,
+    .platform_data = (void *)&gt82x_data,
+};
+
+static void gt82x_delayed_register(struct work_struct *work)
+{
+    struct i2c_adapter *adapter;
+    struct i2c_client *client;
+
+    printk(KERN_INFO "g04_goodix: delayed register start\n");
+    m6ref_set_vccx2(1);
+    adapter = i2c_get_adapter(0);
+    if (!adapter) {
+        printk(KERN_ERR "g04_goodix: i2c adapter 0 not ready\n");
+        return;
+    }
+
+    client = i2c_new_device(adapter, &gt82x_i2c_info);
+    i2c_put_adapter(adapter);
+    if (!client)
+        printk(KERN_ERR "g04_goodix: i2c_new_device failed\n");
+    else
+        printk(KERN_INFO "g04_goodix: created i2c client addr=0x%x\n", client->addr);
+}
+
+static DECLARE_DELAYED_WORK(gt82x_delayed_work, gt82x_delayed_register);
+
+static void gt82x_schedule_delayed_register(void)
+{
+    printk(KERN_INFO "g04_goodix: schedule delayed register\n");
+    schedule_delayed_work(&gt82x_delayed_work, msecs_to_jiffies(12000));
+}
+#endif
+
 #ifdef CONFIG_FOCALTECH_CAPACITIVE_TOUCHSCREEN
 #include <linux/ft5x06_ts.h>
 #define GPIO_FT_RST  PAD_GPIOC_3
@@ -1270,9 +1364,7 @@ static struct i2c_board_info __initdata aml_i2c_bus_info_a[] = {
     },
 #endif
 #ifdef CONFIG_GOODIX_GT82X_CAPACITIVE_TOUCHSCREEN
-    {
-        I2C_BOARD_INFO("Goodix-TS", 0x5d),
-    },
+    /* Goodix is registered later after panel/power settle. */
 #endif
 #ifdef CONFIG_FOCALTECH_CAPACITIVE_TOUCHSCREEN
     {
@@ -1295,7 +1387,7 @@ static struct i2c_board_info __initdata aml_i2c_bus_info_ao[] = {
     {
         I2C_BOARD_INFO("axp20_mfd", AXP20_ADDR),
         .platform_data = &axp_pdata,
-        .addr = AXP20_ADDR, //axp_cfg.pmu_twi_addr,
+        .addr = AXP20_ADDR, //board_battery.pmu_twi_addr,
         .irq = INT_WATCHDOG,	//0 smp irq number base change to 32
     },
 #endif
@@ -1422,19 +1514,24 @@ static struct mtd_partition normal_partition_info[] = {
     {
         .name = "system",
         .offset = 128*SZ_1M+40*SZ_1M,
-        .size = 512*SZ_1M,
+        .size = 768*SZ_1M,
+    },
+    {
+        .name = "factory",
+        .offset = 896*SZ_1M+40*SZ_1M,
+        .size = 128*SZ_1M,
     },
     {
         .name = "cache",
-        .offset = 640*SZ_1M+40*SZ_1M,
-        .size = 256*SZ_1M,
+        .offset = 1024*SZ_1M+40*SZ_1M,
+        .size = 128*SZ_1M,
     },
     {
         .name = "userdata",
-        .offset = 896*SZ_1M+40*SZ_1M,
-        .size = 1024*SZ_1M,
+        .offset = 1152*SZ_1M+40*SZ_1M,
+        .size = 2304*SZ_1M,
     },
-    {
+{
         .name = "NFTL_Part",
         .offset = MTDPART_OFS_APPEND,
         .size = MTDPART_SIZ_FULL,
@@ -2251,18 +2348,13 @@ static struct platform_device bt656in_device = {
 //tmp fix by Elvis Yu
 static void m6ref_set_vccx2(int power_on)
 {
-/*
     if (power_on) {
-        printk(KERN_INFO "%s() Power ON\n", __FUNCTION__);
-        axp_gpio_set_io(1,1);	//AXP 202 GPIO1 VCCX2 
-		axp_gpio_set_value(1, 0);	//set AXP 202 GPIO1 low
+        printk(KERN_INFO "%s()5V Power ON\n", __FUNCTION__);
+        gpio_out(PAD_GPIOA_14, 1);
+    } else {
+        printk(KERN_INFO "%s()5V Power Down\n", __FUNCTION__);
+        gpio_out(PAD_GPIOA_14, 0);
     }
-    else {
-        printk(KERN_INFO "%s() Power OFF\n", __FUNCTION__);
-        axp_gpio_set_io(1,1);	//GPIO1 VCCX2 
-		axp_gpio_set_value(1, 1);	////set AXP 202 GPIO1 high
-    }
-   */
 }
 #if defined(CONFIG_SUSPEND)
 static struct meson_pm_config aml_pm_pdata = {
@@ -2484,6 +2576,26 @@ static void power_off(void)
 }
 
 
+#ifdef CONFIG_ANDROID_RAM_CONSOLE
+#define RAM_CONSOLE_PHYS_ADDR 0x84000000
+#define RAM_CONSOLE_SIZE      SZ_1M
+
+static struct resource ram_console_resource[] = {
+    {
+        .start = RAM_CONSOLE_PHYS_ADDR,
+        .end   = RAM_CONSOLE_PHYS_ADDR + RAM_CONSOLE_SIZE - 1,
+        .flags = IORESOURCE_MEM,
+    },
+};
+
+static struct platform_device ram_console_device = {
+    .name          = "ram_console",
+    .id            = -1,
+    .num_resources = ARRAY_SIZE(ram_console_resource),
+    .resource      = ram_console_resource,
+};
+#endif
+
 /***********************************************************************
  * Device Register Section
  **********************************************************************/
@@ -2557,6 +2669,10 @@ static struct platform_device  *platform_devs[] = {
 #endif
 #endif
 
+#ifdef CONFIG_ANDROID_RAM_CONSOLE
+    &ram_console_device,
+#endif
+
 #ifdef CONFIG_POST_PROCESS_MANAGER
 	&ppmgr_device,
 #endif
@@ -2602,6 +2718,10 @@ static __init void meson_init_machine(void)
 #ifdef CONFIG_AM_LCD_OUTPUT
     m6g04_lcd_init();
 #endif
+#ifdef CONFIG_GOODIX_GT82X_CAPACITIVE_TOUCHSCREEN
+    gt82x_schedule_delayed_register();
+#endif
+    m6ref_set_vccx2(1);
 	pm_power_off = power_off;
 }
 static __init void meson_init_early(void)

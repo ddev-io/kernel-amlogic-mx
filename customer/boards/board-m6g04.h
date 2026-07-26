@@ -49,7 +49,7 @@
 #define OSD_576_PIX         (768*576)
 #define OSD_720_PIX         (1280*720)
 #define OSD_1080_PIX        (1920*1080)
-#define OSD_PANEL_PIX       (1024*600)
+#define OSD_PANEL_PIX       (1280*800)
 #define B16BpP  (2)
 #define B32BpP  (4)
 #define DOUBLE_BUFFER   (2)
@@ -111,9 +111,9 @@
 //32 bytes align
 #ifdef CONFIG_POST_PROCESS_MANAGER
 #ifdef CONFIG_POST_PROCESS_MANAGER_PPSCALER
-#define PPMGR_MEM_SIZE               1024 * 608 * 21
+#define PPMGR_MEM_SIZE               1280 * 800 * 21
 #else
-#define PPMGR_MEM_SIZE               1024 * 608 * 18
+#define PPMGR_MEM_SIZE               1280 * 800 * 18
 #endif
 #else
 #define PPMGR_MEM_SIZE		0

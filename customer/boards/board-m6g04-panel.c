@@ -88,17 +88,17 @@ static Bool_t bl_status = ON;
 //*****************************************
 // Define LCD Timing Parameters
 //*****************************************
-#define ACITVE_AREA_WIDTH	154	//unit: mm
-#define ACITVE_AREA_HEIGHT	90	//unit: mm
+#define ACITVE_AREA_WIDTH	217	//unit: mm
+#define ACITVE_AREA_HEIGHT	136	//unit: mm
 #define LCD_TYPE			LCD_DIGITAL_LVDS   //LCD_DIGITAL_TTL  //LCD_DIGITAL_LVDS  //LCD_DIGITAL_MINILVDS
 #define LCD_BITS			8	//6	//8
 
-#define H_ACTIVE			1024
-#define V_ACTIVE			600
-#define H_PERIOD			1344
-#define V_PERIOD			635
+#define H_ACTIVE			1280
+#define V_ACTIVE			800
+#define H_PERIOD			1440
+#define V_PERIOD			823
 //#define FRAME_RATE			50
-#define	LCD_CLK				42900000//(H_PERIOD * V_PERIOD * FRAME_RATE)	//unit: Hz
+#define	LCD_CLK				71100000//(H_PERIOD * V_PERIOD * FRAME_RATE)	//unit: Hz
 #define CLK_SS_LEVEL		0	//0~5, 0 for disable spread spectrum
 #define CLK_AUTO_GEN		1	//1, auto generate clk parameters	//0, user set pll_ctrl, div_ctrl & clk_ctrl
 

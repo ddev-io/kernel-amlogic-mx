@@ -962,11 +962,10 @@ static void __exit cleanup_aml_nftl(void)
 	deregister_mtd_blktrans(&aml_nftl_tr);
 }
 
-#if defined(CONFIG_DEFERRED_MODULE_INIT) && defined(CONFIG_AML_NFTL)
-deferred_module_init(init_aml_nftl);
-#else
+/* Recovery does not load the deferred-driver trigger used by Android.
+ * Register NFTL during the normal initcall pass so /dev/avnftl* is available
+ * when recovery probes internal storage. */
 module_init(init_aml_nftl);
-#endif
 module_exit(cleanup_aml_nftl);
 
 

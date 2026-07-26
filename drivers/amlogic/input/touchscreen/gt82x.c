@@ -284,7 +284,7 @@ static void goodix_ts_work_func(struct work_struct *work)
                 y = (*(p+2) << 8) | *(p+3);
                 if (ts->pdata->swap_xy) swap(x, y);
                 if (ts->pdata->xpol) x = ts->pdata->xmax+ ts->pdata->xmin - x;
-                if (ts->pdata->ypol) y = ts->pdata->ymax+ ts->pdata->ymin - x;
+                if (ts->pdata->ypol) y = ts->pdata->ymax+ ts->pdata->ymin - y;
                 input_report_key(ts->input_dev, BTN_TOUCH, 1);
                 input_report_abs(ts->input_dev, ABS_MT_TRACKING_ID, i);
                 input_report_abs(ts->input_dev, ABS_MT_POSITION_X, x);

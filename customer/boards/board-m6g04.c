@@ -1264,6 +1264,9 @@ static struct ctp_platform_data gt82x_data = {
     .gpio_power = PAD_GPIOA_23,
     .gpio_reset = PAD_GPIOC_3,
     .gpio_enable = 0,
+    .swap_xy = 1,
+    .xpol = 1,
+    .ypol = 1,
     .xmin = 0,
     .xmax = GT82X_XRES,
     .ymin = 0,
@@ -1302,7 +1305,7 @@ static DECLARE_DELAYED_WORK(gt82x_delayed_work, gt82x_delayed_register);
 static void gt82x_schedule_delayed_register(void)
 {
     printk(KERN_INFO "g04_goodix: schedule delayed register\n");
-    schedule_delayed_work(&gt82x_delayed_work, msecs_to_jiffies(12000));
+    schedule_delayed_work(&gt82x_delayed_work, msecs_to_jiffies(4000));
 }
 #endif
 

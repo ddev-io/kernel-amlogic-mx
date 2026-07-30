@@ -1512,29 +1512,14 @@ static struct mtd_partition normal_partition_info[] = {
     {
         .name = "boot",
         .offset = 96*SZ_1M+40*SZ_1M,
+        .size = 32*SZ_1M,
+    },
+    {
+        .name = "misc",
+        .offset = 144*SZ_1M+40*SZ_1M,
         .size = 8*SZ_1M,
     },
     {
-        .name = "system",
-        .offset = 128*SZ_1M+40*SZ_1M,
-        .size = 768*SZ_1M,
-    },
-    {
-        .name = "factory",
-        .offset = 896*SZ_1M+40*SZ_1M,
-        .size = 128*SZ_1M,
-    },
-    {
-        .name = "cache",
-        .offset = 1024*SZ_1M+40*SZ_1M,
-        .size = 128*SZ_1M,
-    },
-    {
-        .name = "userdata",
-        .offset = 1152*SZ_1M+40*SZ_1M,
-        .size = 2304ULL*SZ_1M,
-    },
-{
         .name = "NFTL_Part",
         .offset = MTDPART_OFS_APPEND,
         .size = MTDPART_SIZ_FULL,

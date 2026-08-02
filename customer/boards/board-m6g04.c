@@ -1577,7 +1577,13 @@ static struct aml_nand_platform aml_nand_mid_platform[] = {
 
 static struct aml_nand_device aml_nand_mid_device = {
     .aml_nand_platform = aml_nand_mid_platform,
-    .dev_num = ARRAY_SIZE(aml_nand_mid_platform),
+#ifndef CONFIG_AMLOGIC_SPI_NOR
+    /* G331 rescue: expose only the bootloader NAND as mtd0. */
+    .dev_num = 1,
+#else
+    /* Never fall through to the normal/NFTL NAND entry in rescue builds. */
+    .dev_num = 0,
+#endif
 };
 
 static struct resource aml_nand_resources[] = {

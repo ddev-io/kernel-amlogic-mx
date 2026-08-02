@@ -10,6 +10,7 @@
 #include <linux/platform_device.h>
 #include <linux/delay.h>
 #include <linux/err.h>
+#include <linux/errno.h>
 #include <linux/slab.h>
 #include <linux/io.h>
 #include <linux/bitops.h>
@@ -1725,6 +1726,7 @@ static void aml_platform_adjust_timing(struct aml_nand_chip *aml_chip)
 }
 static int aml_repair_bbt(struct aml_nand_chip *aml_chip,unsigned int *bad_blk_addr,int cnt)
 {
+#if 0 /* G331 rescue: never erase/test blocks during automatic BBT repair. */
 	 int mini_part_blk_num, start_blk ,i,j;
 	struct mtd_info *mtd = &aml_chip->mtd;
 	struct erase_info erase_info_test;
@@ -1820,6 +1822,13 @@ static int aml_repair_bbt(struct aml_nand_chip *aml_chip,unsigned int *bad_blk_a
 		kfree(data_buf);
 	printk("###bbt write into nand flash\n");
 	return aml_nand_update_env(mtd);
+#endif
+	(void)aml_chip;
+	(void)bad_blk_addr;
+	printk(KERN_WARNING
+		"G331 rescue: automatic NAND BBT repair blocked (count=%d)\n",
+		cnt);
+	return -EPERM;
 }
 static int aml_nand_add_partition(struct aml_nand_chip *aml_chip)
 {
@@ -1952,11 +1961,17 @@ static int aml_nand_add_partition(struct aml_nand_chip *aml_chip)
 						continue;
 					}
 					else if(error){
-							if(bad_block_cnt < 128)
-								bad_blk_addr[bad_block_cnt] = offset>> phys_erase_shift;
-						printk("%s:%d find %d bad addr =%d\n",__func__,__LINE__,bad_block_cnt,bad_blk_addr[bad_block_cnt]);
-							bad_block_cnt++;
+						if (bad_block_cnt < ARRAY_SIZE(bad_blk_addr)) {
+							bad_blk_addr[bad_block_cnt] = offset >> phys_erase_shift;
+							printk("%s:%d find %d bad addr =%d\n", __func__,
+								__LINE__, bad_block_cnt, bad_blk_addr[bad_block_cnt]);
 						}
+						else if (bad_block_cnt == ARRAY_SIZE(bad_blk_addr))
+							printk(KERN_WARNING
+								"G331 rescue: bad block list truncated at %u entries\n",
+								(unsigned int)ARRAY_SIZE(bad_blk_addr));
+						bad_block_cnt++;
+					}
 					start_blk++;
 				} while (start_blk < (mini_part_size >> phys_erase_shift));
 				if(mini_part_size > NAND_SYS_PART_SIZE) {
@@ -1978,11 +1993,17 @@ static int aml_nand_add_partition(struct aml_nand_chip *aml_chip)
 						continue;
 					}
 					else if(error){
-							if(bad_block_cnt < 128)
-							bad_blk_addr[bad_block_cnt] = offset>> phys_erase_shift;
-							printk("%s:%d find %d bad addr =%d\n",bad_block_cnt,bad_blk_addr[bad_block_cnt]);
-							bad_block_cnt++;
+						if (bad_block_cnt < ARRAY_SIZE(bad_blk_addr)) {
+							bad_blk_addr[bad_block_cnt] = offset >> phys_erase_shift;
+							printk("%s:%d find %d bad addr =%d\n", __func__,
+								__LINE__, bad_block_cnt, bad_blk_addr[bad_block_cnt]);
 						}
+						else if (bad_block_cnt == ARRAY_SIZE(bad_blk_addr))
+							printk(KERN_WARNING
+								"G331 rescue: bad block list truncated at %u entries\n",
+								(unsigned int)ARRAY_SIZE(bad_blk_addr));
+						bad_block_cnt++;
+					}
 					start_blk++;
 				} while (start_blk < (mini_part_size >> phys_erase_shift));
 					if(mini_part_size > NAND_SYS_PART_SIZE) {
@@ -5674,6 +5695,7 @@ exit:
 
 static int aml_nand_save_env(struct mtd_info *mtd, u_char *buf)
 {
+#if 0 /* G331 rescue: environment/BBT metadata must remain read-only. */
 	struct aml_nand_bbt_info *nand_bbt_info;
 	struct env_free_node_t *env_free_node, *env_tmp_node;
 	int error = 0, pages_per_blk, i = 1;
@@ -6027,10 +6049,16 @@ exit:
 	}
 	return err;
 
+#endif
+	(void)mtd;
+	(void)buf;
+	printk(KERN_WARNING "G331 rescue: NAND environment save blocked\n");
+	return -EPERM;
 }
 
 static int aml_nand_update_env(struct mtd_info *mtd)
 {
+#if 0 /* G331 rescue: environment/BBT metadata must remain read-only. */
 	struct aml_nand_chip *aml_chip = mtd_to_nand_chip(mtd);
 	env_t *env_ptr;
 	loff_t offset;
@@ -6060,6 +6088,10 @@ static int aml_nand_update_env(struct mtd_info *mtd)
 	}
 
 	return error;
+#endif
+	(void)mtd;
+	printk(KERN_WARNING "G331 rescue: NAND environment update blocked\n");
+	return -EPERM;
 }
 
 static int aml_nand_env_check(struct mtd_info *mtd)
@@ -7180,6 +7212,10 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 		err = -ENXIO;
 		goto exit_error;
 	}
+	if (!strncmp((char*)plat->name, NAND_BOOT_NAME,
+			strlen((const char*)NAND_BOOT_NAME)))
+		printk(KERN_INFO
+			"G331 rescue: bootloader-only writable MTD initialized\n");
 
 	dev_dbg(aml_chip->device, "initialized ok\n");
 	return 0;

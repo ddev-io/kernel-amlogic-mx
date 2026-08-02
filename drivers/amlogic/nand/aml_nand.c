@@ -5803,6 +5803,11 @@ exit:
 		env_free_node = NULL;
 	}
 	return error;
+#endif
+	(void)mtd;
+	(void)buf;
+	printk(KERN_WARNING "G331 rescue: NAND environment save blocked\n");
+	return -EPERM;
 }
 
 static int aml_nand_env_init(struct mtd_info *mtd)
@@ -6048,12 +6053,6 @@ exit:
 		env_free_node = NULL;
 	}
 	return err;
-
-#endif
-	(void)mtd;
-	(void)buf;
-	printk(KERN_WARNING "G331 rescue: NAND environment save blocked\n");
-	return -EPERM;
 }
 
 static int aml_nand_update_env(struct mtd_info *mtd)

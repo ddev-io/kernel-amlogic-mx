@@ -6652,7 +6652,8 @@ static int g333_bbt_journal_show(struct seq_file *seq, void *unused)
 		return 0;
 	}
 
-	start_addr = (1024ULL * mtd->writesize / aml_chip->plane_num);
+	start_addr = div_u64(1024ULL * mtd->writesize,
+			     aml_chip->plane_num);
 #ifdef NEW_NAND_SUPPORT
 	if ((aml_chip->new_nand_info.type) &&
 	    (aml_chip->new_nand_info.type < 10))

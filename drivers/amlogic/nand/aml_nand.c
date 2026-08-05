@@ -16,6 +16,9 @@
 #include <linux/bitops.h>
 #include <linux/crc32.h>
 #include <linux/fs.h>
+#include <linux/math64.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <asm/uaccess.h>
 
 #include <linux/mtd/mtd.h>
@@ -6607,6 +6610,206 @@ static struct class_attribute nand_class_attrs[] = {
     __ATTR_NULL
 };
 
+static int g333_bbt_journal_show(struct seq_file *seq, void *unused)
+{
+	struct aml_nand_chip *aml_chip = seq->private;
+	struct mtd_info *mtd = &aml_chip->mtd;
+	struct mtd_oob_ops ops;
+	struct env_oobinfo_t *oobinfo;
+	struct aml_nand_bbt_info *bbt;
+	struct aml_nand_part_info *part;
+	env_t *env_ptr;
+	u_char *oob_buf;
+	uint64_t start_addr, addr;
+	unsigned int start_blk, block, page;
+	unsigned int pages_per_blk, max_env_blk, total_blk;
+	unsigned int valid_slots = 0, crc_slots = 0, read_errors = 0;
+	unsigned int entries, factory, runtime, out_of_range, part_count;
+	uint64_t logo, aml_logo, recovery, boot, system;
+	uint64_t factory_part, cache, userdata;
+	u32 calc_crc, bbt_crc;
+	int error, i;
+
+	(void)unused;
+	if (!aml_chip->aml_nandenv_info) {
+		seq_puts(seq, "error=no_nand_environment\n");
+		return 0;
+	}
+	if ((default_environment_size + sizeof(*bbt)) > ENV_SIZE) {
+		seq_printf(seq,
+			"error=invalid_bbt_offset offset=0x%x size=0x%lx env=0x%x\n",
+			default_environment_size, (unsigned long)sizeof(*bbt),
+			ENV_SIZE);
+		return 0;
+	}
+
+	env_ptr = kzalloc(sizeof(*env_ptr), GFP_KERNEL);
+	oob_buf = kzalloc(sizeof(*oobinfo), GFP_KERNEL);
+	if (!env_ptr || !oob_buf) {
+		seq_puts(seq, "error=no_memory\n");
+		kfree(env_ptr);
+		kfree(oob_buf);
+		return 0;
+	}
+
+	start_addr = (1024ULL * mtd->writesize / aml_chip->plane_num);
+#ifdef NEW_NAND_SUPPORT
+	if ((aml_chip->new_nand_info.type) &&
+	    (aml_chip->new_nand_info.type < 10))
+		start_addr += RETRY_NAND_BLK_NUM * mtd->erasesize;
+#endif
+	start_blk = div_u64(start_addr, mtd->erasesize);
+	max_env_blk = NAND_MINI_PART_SIZE / mtd->erasesize;
+	if (max_env_blk < 2)
+		max_env_blk = 2;
+	pages_per_blk = mtd->erasesize / mtd->writesize;
+	total_blk = div_u64(mtd->size, mtd->erasesize);
+	oobinfo = (struct env_oobinfo_t *)oob_buf;
+
+	seq_printf(seq,
+		"g333=read_only start_block=%u blocks=%u pages_per_block=%u "
+		"write_size=0x%x erase_size=0x%x total_blocks=%u "
+		"bbt_offset=0x%x bbt_size=0x%lx\n",
+		start_blk, max_env_blk, pages_per_blk, mtd->writesize,
+		mtd->erasesize, total_blk, default_environment_size,
+		(unsigned long)sizeof(*bbt));
+
+	for (block = start_blk; block < start_blk + max_env_blk; block++) {
+		for (page = 0; page < pages_per_blk; page++) {
+			addr = (uint64_t)block * mtd->erasesize +
+			       (uint64_t)page * mtd->writesize;
+			memset(env_ptr, 0, sizeof(*env_ptr));
+			memset(oob_buf, 0, sizeof(*oobinfo));
+			memset(&ops, 0, sizeof(ops));
+			ops.mode = MTD_OOB_AUTO;
+			ops.len = mtd->writesize;
+			ops.ooblen = sizeof(*oobinfo);
+			ops.ooboffs = mtd->ecclayout->oobfree[0].offset;
+			ops.datbuf = (u_char *)env_ptr;
+			ops.oobbuf = oob_buf;
+
+			error = mtd->read_oob(mtd, addr, &ops);
+			if ((error != 0) && (error != -EUCLEAN)) {
+				read_errors++;
+				continue;
+			}
+			if (memcmp(oobinfo->name, ENV_NAND_MAGIC, 4))
+				continue;
+
+			valid_slots++;
+			calc_crc = crc32((0 ^ 0xffffffffL), env_ptr->data,
+					 ENV_SIZE) ^ 0xffffffffL;
+			if (calc_crc == env_ptr->crc)
+				crc_slots++;
+
+			bbt = (struct aml_nand_bbt_info *)
+				(env_ptr->data + default_environment_size);
+			entries = 0;
+			factory = 0;
+			runtime = 0;
+			out_of_range = 0;
+			for (i = 0; i < MAX_BAD_BLK_NUM; i++) {
+				u16 value = (u16)bbt->nand_bbt[i];
+
+				if (!value)
+					continue;
+				entries++;
+				if (value & 0x8000)
+					factory++;
+				else
+					runtime++;
+				if ((value & 0x7fff) >= total_blk)
+					out_of_range++;
+			}
+			bbt_crc = crc32((0 ^ 0xffffffffL),
+					(u_char *)bbt, sizeof(*bbt)) ^ 0xffffffffL;
+
+			part_count = 0;
+			logo = 0;
+			aml_logo = 0;
+			recovery = 0;
+			boot = 0;
+			system = 0;
+			factory_part = 0;
+			cache = 0;
+			userdata = 0;
+			for (i = 0; i < MAX_MTD_PART_NUM; i++) {
+				part = &bbt->aml_nand_part[i];
+				if (memcmp(part->mtd_part_magic, MTD_PART_MAGIC, 4))
+					break;
+				part_count++;
+				if (!strncmp(part->mtd_part_name, "logo",
+					     MAX_MTD_PART_NAME_LEN))
+					logo = part->size;
+				else if (!strncmp(part->mtd_part_name, "aml_logo",
+						  MAX_MTD_PART_NAME_LEN))
+					aml_logo = part->size;
+				else if (!strncmp(part->mtd_part_name, "recovery",
+						  MAX_MTD_PART_NAME_LEN))
+					recovery = part->size;
+				else if (!strncmp(part->mtd_part_name, "boot",
+						  MAX_MTD_PART_NAME_LEN))
+					boot = part->size;
+				else if (!strncmp(part->mtd_part_name, "system",
+						  MAX_MTD_PART_NAME_LEN))
+					system = part->size;
+				else if (!strncmp(part->mtd_part_name, "factory",
+						  MAX_MTD_PART_NAME_LEN))
+					factory_part = part->size;
+				else if (!strncmp(part->mtd_part_name, "cache",
+						  MAX_MTD_PART_NAME_LEN))
+					cache = part->size;
+				else if (!strncmp(part->mtd_part_name, "userdata",
+						  MAX_MTD_PART_NAME_LEN))
+					userdata = part->size;
+			}
+
+			seq_printf(seq,
+				"slot=%u:%u addr=0x%llx ts=%u ec=%d status=%u "
+				"crc=%s stored=0x%08x calc=0x%08x "
+				"bbt=%s bbt_crc=0x%08x entries=%u factory=%u "
+				"runtime=%u out_of_range=%u parts=%u "
+				"sizes=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx\n",
+				block, page, (unsigned long long)addr,
+				oobinfo->timestamp, oobinfo->ec,
+				oobinfo->status_page,
+				(calc_crc == env_ptr->crc) ? "ok" : "bad",
+				env_ptr->crc, calc_crc,
+				(!memcmp(bbt->bbt_head_magic, BBT_HEAD_MAGIC, 4) &&
+				 !memcmp(bbt->bbt_tail_magic, BBT_TAIL_MAGIC, 4)) ?
+					"ok" : "bad",
+				bbt_crc, entries, factory, runtime, out_of_range,
+				part_count, (unsigned long long)logo,
+				(unsigned long long)aml_logo,
+				(unsigned long long)recovery,
+				(unsigned long long)boot,
+				(unsigned long long)system,
+				(unsigned long long)factory_part,
+				(unsigned long long)cache,
+				(unsigned long long)userdata);
+		}
+	}
+
+	seq_printf(seq, "summary valid_slots=%u crc_ok=%u read_errors=%u\n",
+		   valid_slots, crc_slots, read_errors);
+	kfree(oob_buf);
+	kfree(env_ptr);
+	return 0;
+}
+
+static int g333_bbt_journal_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, g333_bbt_journal_show, PDE(inode)->data);
+}
+
+static const struct file_operations g333_bbt_journal_fops = {
+	.owner = THIS_MODULE,
+	.open = g333_bbt_journal_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 int aml_nand_init(struct aml_nand_chip *aml_chip)
 {
 	struct aml_nand_platform *plat = aml_chip->platform;
@@ -7224,9 +7427,16 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
         strcpy((char *)(aml_chip->cls.name), (const char*)NAND_MULTI_NAME);
         //sprintf(aml_chip->cls.name, NAND_MULTI_NAME);
         aml_chip->cls.class_attrs = nand_class_attrs;
-       	err = class_register(&aml_chip->cls);
-    	if(err)
-    		printk(" class register nand_class fail!\n");
+		err = class_register(&aml_chip->cls);
+		if (err)
+			printk(" class register nand_class fail!\n");
+		if (!proc_create_data("g333_bbt_journal", S_IRUGO, NULL,
+				      &g333_bbt_journal_fops, aml_chip))
+			printk(KERN_ERR
+				"G333 rescue: failed to create BBT journal diagnostic\n");
+		else
+			printk(KERN_INFO
+				"G333 rescue: read-only BBT journal diagnostic ready\n");
 	}
 
 	if (aml_nand_add_partition(aml_chip) != 0) {

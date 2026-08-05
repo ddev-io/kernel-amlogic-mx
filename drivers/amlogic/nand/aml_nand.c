@@ -6610,25 +6610,28 @@ static struct class_attribute nand_class_attrs[] = {
     __ATTR_NULL
 };
 
-static int g333_bbt_journal_show(struct seq_file *seq, void *unused)
+static int g334_bbt_journal_show(struct seq_file *seq, void *unused)
 {
 	struct aml_nand_chip *aml_chip = seq->private;
 	struct mtd_info *mtd = &aml_chip->mtd;
 	struct mtd_oob_ops ops;
 	struct env_oobinfo_t *oobinfo;
+	struct env_free_node_t *free_node;
+	struct env_valid_node_t *valid;
 	struct aml_nand_bbt_info *bbt;
 	struct aml_nand_part_info *part;
 	env_t *env_ptr;
 	u_char *oob_buf;
 	uint64_t start_addr, addr;
-	unsigned int start_blk, block, page;
-	unsigned int pages_per_blk, max_env_blk, total_blk;
+	unsigned int start_blk, scan_end_blk, block, page;
+	unsigned int pages_per_blk, journal_blocks, total_blk;
 	unsigned int valid_slots = 0, crc_slots = 0, read_errors = 0;
+	unsigned int block_slots, block_errors;
 	unsigned int entries, factory, runtime, out_of_range, part_count;
 	uint64_t logo, aml_logo, recovery, boot, system;
 	uint64_t factory_part, cache, userdata;
 	u32 calc_crc, bbt_crc;
-	int error, i;
+	int error, i, node_count;
 
 	(void)unused;
 	if (!aml_chip->aml_nandenv_info) {
@@ -6660,22 +6663,47 @@ static int g333_bbt_journal_show(struct seq_file *seq, void *unused)
 		start_addr += RETRY_NAND_BLK_NUM * mtd->erasesize;
 #endif
 	start_blk = div_u64(start_addr, mtd->erasesize);
-	max_env_blk = NAND_MINI_PART_SIZE / mtd->erasesize;
-	if (max_env_blk < 2)
-		max_env_blk = 2;
+	journal_blocks = NAND_MINI_PART_SIZE / mtd->erasesize;
+	if (journal_blocks < 2)
+		journal_blocks = 2;
 	pages_per_blk = mtd->erasesize / mtd->writesize;
 	total_blk = div_u64(mtd->size, mtd->erasesize);
+	scan_end_blk = min_t(unsigned int, ENV_NAND_SCAN_BLK, total_blk);
 	oobinfo = (struct env_oobinfo_t *)oob_buf;
 
 	seq_printf(seq,
-		"g333=read_only start_block=%u blocks=%u pages_per_block=%u "
+		"g334=read_only start_block=%u scan_end_block=%u "
+		"journal_blocks=%u pages_per_block=%u "
 		"write_size=0x%x erase_size=0x%x total_blocks=%u "
 		"bbt_offset=0x%x bbt_size=0x%lx\n",
-		start_blk, max_env_blk, pages_per_blk, mtd->writesize,
-		mtd->erasesize, total_blk, default_environment_size,
+		start_blk, scan_end_blk, journal_blocks, pages_per_blk,
+		mtd->writesize, mtd->erasesize, total_blk, default_environment_size,
 		(unsigned long)sizeof(*bbt));
 
-	for (block = start_blk; block < start_blk + max_env_blk; block++) {
+	if (aml_chip->aml_nandenv_info->env_valid) {
+		valid = aml_chip->aml_nandenv_info->env_valid_node;
+		addr = (uint64_t)valid->phy_blk_addr * mtd->erasesize +
+		       (uint64_t)valid->phy_page_addr * mtd->writesize;
+		seq_printf(seq,
+			"selected block=%d page=%d addr=0x%llx ts=%u ec=%d\n",
+			valid->phy_blk_addr, valid->phy_page_addr,
+			(unsigned long long)addr, valid->timestamp, valid->ec);
+	} else {
+		seq_puts(seq, "selected=none\n");
+	}
+
+	free_node = aml_chip->aml_nandenv_info->env_free_node;
+	for (node_count = 0; free_node && node_count < ENV_NAND_SCAN_BLK;
+	     node_count++, free_node = free_node->next)
+		seq_printf(seq, "journal_node=%d block=%d ec=%d dirty=%d\n",
+			node_count, free_node->phy_blk_addr, free_node->ec,
+			free_node->dirty_flag);
+	if (free_node)
+		seq_puts(seq, "journal_nodes=truncated\n");
+
+	for (block = start_blk; block < scan_end_blk; block++) {
+		block_slots = 0;
+		block_errors = 0;
 		for (page = 0; page < pages_per_blk; page++) {
 			addr = (uint64_t)block * mtd->erasesize +
 			       (uint64_t)page * mtd->writesize;
@@ -6692,12 +6720,14 @@ static int g333_bbt_journal_show(struct seq_file *seq, void *unused)
 			error = mtd->read_oob(mtd, addr, &ops);
 			if ((error != 0) && (error != -EUCLEAN)) {
 				read_errors++;
+				block_errors++;
 				continue;
 			}
 			if (memcmp(oobinfo->name, ENV_NAND_MAGIC, 4))
 				continue;
 
 			valid_slots++;
+			block_slots++;
 			calc_crc = crc32((0 ^ 0xffffffffL), env_ptr->data,
 					 ENV_SIZE) ^ 0xffffffffL;
 			if (calc_crc == env_ptr->crc)
@@ -6788,7 +6818,19 @@ static int g333_bbt_journal_show(struct seq_file *seq, void *unused)
 				(unsigned long long)factory_part,
 				(unsigned long long)cache,
 				(unsigned long long)userdata);
+
+			if ((calc_crc == env_ptr->crc) &&
+			    !memcmp(bbt->bbt_head_magic, BBT_HEAD_MAGIC, 4) &&
+			    !memcmp(bbt->bbt_tail_magic, BBT_TAIL_MAGIC, 4) &&
+			    (entries <= 256)) {
+				seq_printf(seq, "bbt_raw=%u:%u:", block, page);
+				for (i = 0; i < (int)sizeof(*bbt); i++)
+					seq_printf(seq, "%02x", ((u8 *)bbt)[i]);
+				seq_putc(seq, '\n');
+			}
 		}
+		seq_printf(seq, "block=%u valid_slots=%u read_errors=%u\n",
+			block, block_slots, block_errors);
 	}
 
 	seq_printf(seq, "summary valid_slots=%u crc_ok=%u read_errors=%u\n",
@@ -6798,14 +6840,14 @@ static int g333_bbt_journal_show(struct seq_file *seq, void *unused)
 	return 0;
 }
 
-static int g333_bbt_journal_open(struct inode *inode, struct file *file)
+static int g334_bbt_journal_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, g333_bbt_journal_show, PDE(inode)->data);
+	return single_open(file, g334_bbt_journal_show, PDE(inode)->data);
 }
 
-static const struct file_operations g333_bbt_journal_fops = {
+static const struct file_operations g334_bbt_journal_fops = {
 	.owner = THIS_MODULE,
-	.open = g333_bbt_journal_open,
+	.open = g334_bbt_journal_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = single_release,
@@ -7431,13 +7473,13 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 		err = class_register(&aml_chip->cls);
 		if (err)
 			printk(" class register nand_class fail!\n");
-		if (!proc_create_data("g333_bbt_journal", S_IRUGO, NULL,
-				      &g333_bbt_journal_fops, aml_chip))
+		if (!proc_create_data("g334_bbt_journal", S_IRUGO, NULL,
+				      &g334_bbt_journal_fops, aml_chip))
 			printk(KERN_ERR
-				"G333 rescue: failed to create BBT journal diagnostic\n");
+				"G334 rescue: failed to create full BBT journal diagnostic\n");
 		else
 			printk(KERN_INFO
-				"G333 rescue: read-only BBT journal diagnostic ready\n");
+				"G334 rescue: read-only full BBT journal diagnostic ready\n");
 	}
 
 	if (aml_nand_add_partition(aml_chip) != 0) {

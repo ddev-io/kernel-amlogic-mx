@@ -1726,7 +1726,7 @@ static void aml_platform_adjust_timing(struct aml_nand_chip *aml_chip)
 }
 static int aml_repair_bbt(struct aml_nand_chip *aml_chip,unsigned int *bad_blk_addr,int cnt)
 {
-#if 0 /* G331 rescue: never erase/test blocks during automatic BBT repair. */
+#if 0 /* G332 rescue: never erase/test blocks during automatic BBT repair. */
 	 int mini_part_blk_num, start_blk ,i,j;
 	struct mtd_info *mtd = &aml_chip->mtd;
 	struct erase_info erase_info_test;
@@ -1826,7 +1826,7 @@ static int aml_repair_bbt(struct aml_nand_chip *aml_chip,unsigned int *bad_blk_a
 	(void)aml_chip;
 	(void)bad_blk_addr;
 	printk(KERN_WARNING
-		"G331 rescue: automatic NAND BBT repair blocked (count=%d)\n",
+		"G332 rescue: automatic NAND BBT repair blocked (count=%d)\n",
 		cnt);
 	return -EPERM;
 }
@@ -1968,7 +1968,7 @@ static int aml_nand_add_partition(struct aml_nand_chip *aml_chip)
 						}
 						else if (bad_block_cnt == ARRAY_SIZE(bad_blk_addr))
 							printk(KERN_WARNING
-								"G331 rescue: bad block list truncated at %u entries\n",
+								"G332 rescue: bad block list truncated at %u entries\n",
 								(unsigned int)ARRAY_SIZE(bad_blk_addr));
 						bad_block_cnt++;
 					}
@@ -2000,7 +2000,7 @@ static int aml_nand_add_partition(struct aml_nand_chip *aml_chip)
 						}
 						else if (bad_block_cnt == ARRAY_SIZE(bad_blk_addr))
 							printk(KERN_WARNING
-								"G331 rescue: bad block list truncated at %u entries\n",
+								"G332 rescue: bad block list truncated at %u entries\n",
 								(unsigned int)ARRAY_SIZE(bad_blk_addr));
 						bad_block_cnt++;
 					}
@@ -2040,6 +2040,13 @@ static int aml_nand_add_partition(struct aml_nand_chip *aml_chip)
 #endif
 	}
 
+	/* G332 publishes every partition read-only; recovery writes use a
+	 * separate, explicitly writable rescue image after diagnosis. */
+	mtd->flags &= ~MTD_WRITEABLE;
+	for (i = 0; i < nr; i++)
+		parts[i].mask_flags |= MTD_WRITEABLE;
+	printk(KERN_INFO "G332 rescue: publishing %d read-only MTD partitions\n",
+		nr);
 	return add_mtd_partitions(mtd, parts, nr);
 #else
 	return add_mtd_device(mtd);
@@ -2637,6 +2644,10 @@ static void aml_nand_erase_cmd(struct mtd_info *mtd, int page)
 	struct nand_chip *chip = mtd->priv;
 	unsigned pages_per_blk_shift = (chip->phys_erase_shift - chip->page_shift);
 	unsigned vt_page_num, i = 0, j = 0, internal_chipnr = 1, page_addr, valid_page_num;
+
+	printk(KERN_WARNING
+		"G332 rescue: low-level NAND erase blocked at page %d\n", page);
+	return;
 
 	vt_page_num = (mtd->writesize / (1 << chip->page_shift));
 	vt_page_num *= (1 << pages_per_blk_shift);
@@ -3359,6 +3370,11 @@ static int aml_nand_write_page(struct mtd_info *mtd, struct nand_chip *chip, con
 	int status;
 	struct aml_nand_chip *aml_chip = mtd_to_nand_chip(mtd);
 
+	printk(KERN_WARNING
+		"G332 rescue: low-level NAND page write blocked at page %d\n",
+		page);
+	return -EPERM;
+
 	chip->cmdfunc(mtd, NAND_CMD_SEQIN, 0x00, page);
 
 	/*if ((cached) && (chip->options & NAND_CACHEPRG))
@@ -3748,9 +3764,10 @@ exit:
 
 static int aml_nand_write_oob(struct mtd_info *mtd, struct nand_chip *chip, int page)
 {
-	printk("our host controller`s structure couldn`t support oob write\n");
-	BUG();
-	return 0;
+	printk(KERN_WARNING
+		"G332 rescue: low-level NAND OOB write blocked at page %d\n",
+		page);
+	return -EPERM;
 }
 
 static int aml_nand_block_bad(struct mtd_info *mtd, loff_t ofs, int getchip)
@@ -3866,12 +3883,17 @@ exit:
 }
 
 static int aml_nand_block_markbad(struct mtd_info *mtd, loff_t ofs)
-{ 
-	struct nand_chip * chip = mtd->priv;	
+{
+	struct nand_chip *chip = mtd->priv;
 	struct aml_nand_chip *aml_chip = mtd_to_nand_chip(mtd);
 	//struct mtd_oob_ops aml_oob_ops;
 	struct mtd_oob_ops  *aml_oob_ops;
 	int blk_addr, mtd_erase_shift, j, ret;
+
+	printk(KERN_WARNING
+		"G332 rescue: NAND markbad blocked at 0x%llx\n",
+		(uint64_t)ofs);
+	return -EPERM;
 
 	aml_oob_ops = kzalloc(sizeof(struct mtd_oob_ops), GFP_KERNEL);
 	if (aml_oob_ops == NULL)
@@ -5695,7 +5717,7 @@ exit:
 
 static int aml_nand_save_env(struct mtd_info *mtd, u_char *buf)
 {
-#if 0 /* G331 rescue: environment/BBT metadata must remain read-only. */
+#if 0 /* G332 rescue: environment/BBT metadata must remain read-only. */
 	struct aml_nand_bbt_info *nand_bbt_info;
 	struct env_free_node_t *env_free_node, *env_tmp_node;
 	int error = 0, pages_per_blk, i = 1;
@@ -5806,7 +5828,7 @@ exit:
 #endif
 	(void)mtd;
 	(void)buf;
-	printk(KERN_WARNING "G331 rescue: NAND environment save blocked\n");
+	printk(KERN_WARNING "G332 rescue: NAND environment save blocked\n");
 	return -EPERM;
 }
 
@@ -6057,7 +6079,7 @@ exit:
 
 static int aml_nand_update_env(struct mtd_info *mtd)
 {
-#if 0 /* G331 rescue: environment/BBT metadata must remain read-only. */
+#if 0 /* G332 rescue: environment/BBT metadata must remain read-only. */
 	struct aml_nand_chip *aml_chip = mtd_to_nand_chip(mtd);
 	env_t *env_ptr;
 	loff_t offset;
@@ -6089,7 +6111,7 @@ static int aml_nand_update_env(struct mtd_info *mtd)
 	return error;
 #endif
 	(void)mtd;
-	printk(KERN_WARNING "G331 rescue: NAND environment update blocked\n");
+	printk(KERN_WARNING "G332 rescue: NAND environment update blocked\n");
 	return -EPERM;
 }
 
@@ -7214,7 +7236,7 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 	if (!strncmp((char*)plat->name, NAND_BOOT_NAME,
 			strlen((const char*)NAND_BOOT_NAME)))
 		printk(KERN_INFO
-			"G331 rescue: bootloader-only writable MTD initialized\n");
+			"G332 rescue: bootloader MTD initialized read-only\n");
 
 	dev_dbg(aml_chip->device, "initialized ok\n");
 	return 0;

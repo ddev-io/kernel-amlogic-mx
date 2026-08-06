@@ -30,6 +30,7 @@
 #include <mach/nand.h>
 #include "g339_service_bbt.h"
 #include "g341_ecc_health.h"
+#include "g343_bbt_restore.h"
 /*
  * CONFIG_SYS_NAND_RESET_CNT is used as a timeout mechanism when resetting
  * a flash.  NAND flash is initialized prior to interrupts so standard timers
@@ -3377,10 +3378,16 @@ static int aml_nand_write_page(struct mtd_info *mtd, struct nand_chip *chip, con
 	int status;
 	struct aml_nand_chip *aml_chip = mtd_to_nand_chip(mtd);
 
+	if (!g343_bbt_write_gate_take(mtd, buf, chip->oob_poi, page,
+					 cached, raw)) {
+		printk(KERN_WARNING
+			"G343 rescue: low-level NAND page write blocked at page %d\n",
+			page);
+		return -EPERM;
+	}
 	printk(KERN_WARNING
-		"G332 rescue: low-level NAND page write blocked at page %d\n",
+		"G343 rescue: one-shot BBT journal page write accepted at page %d\n",
 		page);
-	return -EPERM;
 
 	chip->cmdfunc(mtd, NAND_CMD_SEQIN, 0x00, page);
 
@@ -8127,6 +8134,7 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 		g339_service_bbt_register(aml_chip);
 		printk(KERN_INFO
 			"G342 rescue: verified G341 full ECC rescan disabled\n");
+		g343_bbt_restore_register(aml_chip);
 	}
 
 	if (aml_nand_add_partition(aml_chip) != 0) {

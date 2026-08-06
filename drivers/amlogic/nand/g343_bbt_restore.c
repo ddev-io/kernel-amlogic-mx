@@ -36,7 +36,7 @@
 #define G343_OLD_TIMESTAMP           1U
 #define G343_NEW_TIMESTAMP           2U
 #define G343_EXPECTED_PARTS          9U
-#define G343_NEW_BBT_CRC             0xc2dbb86fU
+#define G343_NEW_BBT_CRC             0xacbcfcadU
 #define G343_COMMAND                 "append-empty-bbt-crc-0171b3b7-page-2"
 
 struct g343_part_expect {
@@ -302,6 +302,17 @@ static void g343_build_new_record(struct g343_state *state)
 	state->new_oob.ec = -1;
 	state->new_oob.timestamp = G343_NEW_TIMESTAMP;
 	state->new_oob.status_page = 1;
+}
+
+/* Compile-time guards for the exact legacy on-flash ABI used by the CRC. */
+static inline void g343_layout_assertions(void)
+{
+	BUILD_BUG_ON(sizeof(struct aml_nand_part_info) != 56);
+	BUILD_BUG_ON(sizeof(struct aml_nand_bbt_info) != 0x1330);
+	BUILD_BUG_ON(offsetof(struct aml_nand_bbt_info, nand_bbt) != 4);
+	BUILD_BUG_ON(offsetof(struct aml_nand_bbt_info, aml_nand_part) != 0xfa8);
+	BUILD_BUG_ON(offsetof(struct aml_nand_bbt_info, bbt_tail_magic) != 0x1328);
+	BUILD_BUG_ON(sizeof(struct env_oobinfo_t) != 8);
 }
 
 static int g343_preflight(struct g343_state *state)
@@ -602,6 +613,8 @@ int g343_bbt_restore_register(struct aml_nand_chip *aml_chip)
 	struct g343_state *state;
 	unsigned int size = aml_chip->mtd.writesize;
 	unsigned int raw_size = size + aml_chip->mtd.oobsize;
+
+	g343_layout_assertions();
 
 	if (g343_singleton)
 		return -EBUSY;

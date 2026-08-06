@@ -14,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/io.h>
 #include <linux/bitops.h>
+#include <linux/atomic.h>
 #include <linux/crc32.h>
 #include <linux/fs.h>
 #include <linux/math64.h>
@@ -7424,6 +7425,485 @@ static const struct file_operations g336_physical_bbt_fops = {
 	.release = g336_physical_bbt_release,
 };
 
+/*
+ * G338 reproduces Amlogic's shipped_badblock_detect() read sequence without
+ * using the damaged BBT, block_status, ECC, or DMA paths.  For Micron NAND,
+ * the factory marker is the first byte at physical column page_size on the
+ * first and last page of each physical erase block.
+ */
+#define G338_PAGE_POSITIONS 2
+#define G338_EXPECTED_CHIPS 2
+#define G338_EXPECTED_PLANES 2
+#define G338_EXPECTED_COMPONENTS 4
+#define G338_PHYSICAL_PAGE_BYTES 8192
+#define G338_PHYSICAL_OOB_BYTES 448
+#define G338_PHYSICAL_ERASE_BYTES (2 * 1024 * 1024)
+#define G338_PHYSICAL_PAGES_PER_BLOCK 256
+#define G338_PHYSICAL_BLOCKS_PER_CHIP 4096
+#define G338_VIRTUAL_BLOCKS 2048
+#define G338_BOOT_RESERVED_PAGES 1024
+#define G338_TWB_CYCLES 10
+#define G338_TRHW_CYCLES 20
+#define G338_TCCS_CYCLES 20
+
+extern int nand_get_device(struct nand_chip *chip, struct mtd_info *mtd,
+			   int new_state);
+extern void nand_release_device(struct mtd_info *mtd);
+
+struct g338_marker_sample {
+	s32 error;
+	s32 verify_error;
+	u32 physical_page;
+	u8 data0;
+	u8 marker;
+	u8 verify_data0;
+	u8 verify_marker;
+	u8 stable;
+};
+
+struct g338_scan_state {
+	struct aml_nand_chip *aml_chip;
+	struct g338_marker_sample *samples;
+	unsigned int total_blocks;
+	unsigned int start_virtual_block;
+	unsigned int physical_boot_blocks;
+	unsigned int physical_pages_per_block;
+	unsigned int physical_blocks_per_chip;
+	unsigned int component_count;
+	unsigned int valid_chip_mask;
+	unsigned int valid_chip_count;
+	unsigned int component_chip[G338_EXPECTED_COMPONENTS];
+	unsigned int component_plane[G338_EXPECTED_COMPONENTS];
+	unsigned int reads;
+	unsigned int read_errors;
+	unsigned int unstable_points;
+	unsigned int marker_nonff_points;
+	unsigned int candidate_blocks;
+	unsigned int review_blocks;
+};
+
+static atomic_t g338_scan_open = ATOMIC_INIT(0);
+
+static size_t g338_sample_index(const struct g338_scan_state *scan,
+				unsigned int block, unsigned int component,
+				unsigned int page_position)
+{
+	return (((size_t)block * scan->component_count + component) *
+		G338_PAGE_POSITIONS) + page_position;
+}
+
+static int g338_prepare_geometry(struct g338_scan_state *scan)
+{
+	struct aml_nand_chip *aml_chip = scan->aml_chip;
+	struct nand_chip *chip = &aml_chip->chip;
+	struct mtd_info *mtd = &aml_chip->mtd;
+	unsigned int chipnr, plane, component = 0;
+
+	if (aml_chip->mfr_type != NAND_MFR_MICRON || aml_chip->ran_mode)
+		return -EINVAL;
+	if (aml_chip->chip_num != G338_EXPECTED_CHIPS ||
+	    aml_chip->plane_num != G338_EXPECTED_PLANES ||
+	    aml_chip->internal_chipnr != 1)
+		return -EINVAL;
+	if (aml_chip->page_size != G338_PHYSICAL_PAGE_BYTES ||
+	    aml_chip->oob_size != G338_PHYSICAL_OOB_BYTES ||
+	    aml_chip->block_size != G338_PHYSICAL_ERASE_BYTES)
+		return -EINVAL;
+	if (chip->options & NAND_BUSWIDTH_16)
+		return -EINVAL;
+	if (mtd->writesize != G338_EXPECTED_COMPONENTS *
+			     G338_PHYSICAL_PAGE_BYTES ||
+	    mtd->oobsize != G338_EXPECTED_COMPONENTS *
+			   G338_PHYSICAL_OOB_BYTES ||
+	    mtd->erasesize != G338_EXPECTED_COMPONENTS *
+			     G338_PHYSICAL_ERASE_BYTES)
+		return -EINVAL;
+
+	for (chipnr = 0; chipnr < aml_chip->chip_num; chipnr++) {
+		if (!aml_chip->valid_chip[chipnr])
+			continue;
+		scan->valid_chip_mask |= 1U << chipnr;
+		scan->valid_chip_count++;
+		for (plane = 0; plane < aml_chip->plane_num; plane++) {
+			if (component >= G338_EXPECTED_COMPONENTS)
+				return -E2BIG;
+			scan->component_chip[component] = chipnr;
+			scan->component_plane[component] = plane;
+			component++;
+		}
+	}
+	if (scan->valid_chip_count != G338_EXPECTED_CHIPS ||
+	    scan->valid_chip_mask != 0x3 ||
+	    component != G338_EXPECTED_COMPONENTS)
+		return -EINVAL;
+
+	scan->component_count = component;
+	scan->physical_pages_per_block = aml_chip->block_size /
+					 G338_PHYSICAL_PAGE_BYTES;
+	scan->physical_blocks_per_chip = div_u64(chip->chipsize,
+						  aml_chip->block_size);
+	scan->total_blocks = div_u64(mtd->size, mtd->erasesize);
+	scan->physical_boot_blocks = (G338_BOOT_RESERVED_PAGES *
+				      G338_PHYSICAL_PAGE_BYTES) /
+				     aml_chip->block_size;
+	if (scan->physical_pages_per_block !=
+			G338_PHYSICAL_PAGES_PER_BLOCK ||
+	    scan->physical_blocks_per_chip !=
+			G338_PHYSICAL_BLOCKS_PER_CHIP ||
+	    scan->total_blocks != G338_VIRTUAL_BLOCKS ||
+	    scan->physical_boot_blocks != 4 ||
+	    scan->physical_boot_blocks % aml_chip->plane_num)
+		return -EINVAL;
+	scan->start_virtual_block = scan->physical_boot_blocks /
+				    aml_chip->plane_num;
+	return 0;
+}
+
+static int g338_pio_read_marker(struct g338_scan_state *scan,
+				unsigned int chipnr,
+				unsigned int physical_page,
+				u8 *data0, u8 *marker)
+{
+	struct aml_nand_chip *aml_chip = scan->aml_chip;
+	struct nand_chip *chip = &aml_chip->chip;
+	struct mtd_info *mtd = &aml_chip->mtd;
+
+	aml_chip->aml_nand_select_chip(aml_chip, chipnr);
+	chip->cmd_ctrl(mtd, NAND_CMD_READ0, NAND_CTRL_CLE);
+	chip->cmd_ctrl(mtd, 0, NAND_CTRL_ALE);
+	chip->cmd_ctrl(mtd, 0, NAND_CTRL_ALE);
+	chip->cmd_ctrl(mtd, physical_page, NAND_CTRL_ALE);
+	chip->cmd_ctrl(mtd, physical_page >> 8, NAND_CTRL_ALE);
+	chip->cmd_ctrl(mtd, physical_page >> 16, NAND_CTRL_ALE);
+	chip->cmd_ctrl(mtd, NAND_CMD_READSTART, NAND_CTRL_CLE);
+	NFC_SEND_CMD_IDLE(aml_chip->chip_selected, G338_TWB_CYCLES);
+
+	if (!aml_chip->aml_nand_wait_devready(aml_chip, chipnr))
+		return -EBUSY;
+	if (aml_chip->ops_mode & AML_CHIP_NONE_RB) {
+		chip->cmd_ctrl(mtd, NAND_CMD_READ0, NAND_CTRL_CLE);
+		NFC_SEND_CMD_IDLE(aml_chip->chip_selected, G338_TWB_CYCLES);
+	}
+	*data0 = chip->read_byte(mtd);
+	NFC_SEND_CMD_IDLE(aml_chip->chip_selected, G338_TRHW_CYCLES);
+
+	chip->cmd_ctrl(mtd, NAND_CMD_RNDOUT, NAND_CTRL_CLE);
+	chip->cmd_ctrl(mtd, G338_PHYSICAL_PAGE_BYTES, NAND_CTRL_ALE);
+	chip->cmd_ctrl(mtd, G338_PHYSICAL_PAGE_BYTES >> 8, NAND_CTRL_ALE);
+	chip->cmd_ctrl(mtd, NAND_CMD_RNDOUTSTART, NAND_CTRL_CLE);
+	NFC_SEND_CMD_IDLE(aml_chip->chip_selected, G338_TCCS_CYCLES);
+	*marker = chip->read_byte(mtd);
+	return 0;
+}
+
+static void g338_reset_chips(struct g338_scan_state *scan)
+{
+	struct aml_nand_chip *aml_chip = scan->aml_chip;
+	struct nand_chip *chip = &aml_chip->chip;
+	struct mtd_info *mtd = &aml_chip->mtd;
+	unsigned int chipnr;
+
+	for (chipnr = 0; chipnr < aml_chip->chip_num; chipnr++) {
+		if (!aml_chip->valid_chip[chipnr])
+			continue;
+		aml_chip->aml_nand_select_chip(aml_chip, chipnr);
+		chip->cmd_ctrl(mtd, NAND_CMD_RESET, NAND_CTRL_CLE);
+		NFC_SEND_CMD_IDLE(aml_chip->chip_selected, G338_TWB_CYCLES);
+		aml_chip->aml_nand_wait_devready(aml_chip, chipnr);
+	}
+}
+
+static int g338_scan_nand(struct g338_scan_state *scan)
+{
+	struct aml_nand_chip *aml_chip = scan->aml_chip;
+	struct nand_chip *chip = &aml_chip->chip;
+	struct mtd_info *mtd = &aml_chip->mtd;
+	struct g338_marker_sample *sample;
+	unsigned int block, component, page_position;
+	unsigned int physical_block, physical_page;
+	unsigned int block_candidate, block_problem;
+	int error;
+
+	error = g338_prepare_geometry(scan);
+	if (error)
+		return error;
+	scan->samples = vzalloc((size_t)scan->total_blocks *
+				 scan->component_count * G338_PAGE_POSITIONS *
+				 sizeof(*scan->samples));
+	if (!scan->samples)
+		return -ENOMEM;
+
+	error = nand_get_device(chip, mtd, FL_READING);
+	if (error)
+		return error;
+	chip->select_chip(mtd, scan->component_chip[0]);
+	printk(KERN_INFO
+	       "G338 scan: starting virtual blocks %u..%u via Micron PIO marker reads\n",
+	       scan->start_virtual_block, scan->total_blocks - 1);
+
+	for (block = scan->start_virtual_block; block < scan->total_blocks;
+	     block++) {
+		if (!(block & 0x7f))
+			printk(KERN_INFO "G338 scan: block %u/%u\n", block,
+			       scan->total_blocks);
+		block_candidate = 0;
+		block_problem = 0;
+		for (component = 0; component < scan->component_count;
+		     component++) {
+			physical_block = block * G338_EXPECTED_PLANES +
+					 scan->component_plane[component];
+			for (page_position = 0;
+			     page_position < G338_PAGE_POSITIONS;
+			     page_position++) {
+				sample = &scan->samples[g338_sample_index(scan, block,
+						component, page_position)];
+				physical_page = physical_block *
+						scan->physical_pages_per_block;
+				if (page_position)
+					physical_page +=
+						scan->physical_pages_per_block - 1;
+				sample->physical_page = physical_page;
+				sample->data0 = 0xa5;
+				sample->marker = 0xa5;
+				sample->verify_data0 = 0x5a;
+				sample->verify_marker = 0x5a;
+				sample->error = g338_pio_read_marker(scan,
+					scan->component_chip[component], physical_page,
+					&sample->data0, &sample->marker);
+				sample->verify_error = g338_pio_read_marker(scan,
+					scan->component_chip[component], physical_page,
+					&sample->verify_data0,
+					&sample->verify_marker);
+				scan->reads += 2;
+				if (sample->error) {
+					scan->read_errors++;
+					block_problem = 1;
+				}
+				if (sample->verify_error) {
+					scan->read_errors++;
+					block_problem = 1;
+				}
+				sample->stable = !sample->error &&
+					!sample->verify_error &&
+					sample->data0 == sample->verify_data0 &&
+					sample->marker == sample->verify_marker;
+				if (!sample->stable) {
+					scan->unstable_points++;
+					block_problem = 1;
+				}
+				if ((!sample->error && sample->marker != 0xff) ||
+				    (!sample->verify_error &&
+				     sample->verify_marker != 0xff))
+					scan->marker_nonff_points++;
+				if (sample->stable && sample->marker != 0xff)
+					block_candidate = 1;
+			}
+		}
+		if (block_candidate)
+			scan->candidate_blocks++;
+		if (block_candidate || block_problem)
+			scan->review_blocks++;
+	}
+
+	g338_reset_chips(scan);
+	nand_release_device(mtd);
+	printk(KERN_INFO
+	       "G338 scan: complete reads=%u errors=%u unstable=%u marker_nonff_points=%u candidates=%u review_blocks=%u\n",
+	       scan->reads, scan->read_errors, scan->unstable_points,
+	       scan->marker_nonff_points, scan->candidate_blocks,
+	       scan->review_blocks);
+	return 0;
+}
+
+static int g338_block_needs_review(const struct g338_scan_state *scan,
+				   unsigned int block)
+{
+	const struct g338_marker_sample *sample;
+	unsigned int component, page_position;
+
+	if (block < scan->start_virtual_block)
+		return 0;
+	for (component = 0; component < scan->component_count; component++) {
+		for (page_position = 0;
+		     page_position < G338_PAGE_POSITIONS; page_position++) {
+			sample = &scan->samples[g338_sample_index(scan, block,
+					component, page_position)];
+			if (!sample->stable || sample->marker != 0xff)
+				return 1;
+		}
+	}
+	return 0;
+}
+
+static int g338_physical_bbt_show(struct seq_file *seq, void *item)
+{
+	struct g338_scan_state *scan = seq->private;
+	struct aml_nand_chip *aml_chip = scan->aml_chip;
+	struct mtd_info *mtd = &aml_chip->mtd;
+	struct g338_marker_sample *sample;
+	unsigned int block, component, page_position, physical_block;
+	int candidate;
+
+	if (item == SEQ_START_TOKEN) {
+		seq_printf(seq,
+			"g338=read_only scan=complete read_path=micron_vendor_pio_column_page_size "
+			"verification=dual_read data0_and_marker classification=deferred\n");
+		seq_printf(seq,
+			"total_virtual_blocks=%u start_virtual_block=%u physical_boot_blocks=%u "
+			"physical_blocks_per_chip=%u physical_pages_per_block=%u\n",
+			scan->total_blocks, scan->start_virtual_block,
+			scan->physical_boot_blocks,
+			scan->physical_blocks_per_chip,
+			scan->physical_pages_per_block);
+		seq_printf(seq,
+			"configured_chips=%u valid_chips=%u valid_chip_mask=0x%x planes=%u "
+			"mfr_type=0x%x ran_mode=%u physical_page=0x%x physical_oob=0x%x "
+			"physical_erase=0x%x virtual_page=0x%x virtual_erase=0x%x\n",
+			aml_chip->chip_num, scan->valid_chip_count,
+			scan->valid_chip_mask, aml_chip->plane_num,
+			aml_chip->mfr_type, aml_chip->ran_mode,
+			aml_chip->page_size, aml_chip->oob_size,
+			aml_chip->block_size, mtd->writesize, mtd->erasesize);
+		seq_printf(seq,
+			"summary reads=%u read_errors=%u unstable_points=%u marker_nonff_points=%u "
+			"candidate_blocks=%u review_blocks=%u\n",
+			scan->reads, scan->read_errors, scan->unstable_points,
+			scan->marker_nonff_points, scan->candidate_blocks,
+			scan->review_blocks);
+		seq_printf(seq,
+			"policy micron_factory_marker=any_nonff paired_plane_virtual_block=1 "
+			"boot_reserved_unclassified=1 proposed_factory_entry=none no_bbt_write=1\n");
+		for (component = 0; component < scan->component_count;
+		     component++)
+			seq_printf(seq,
+				   "component_map=%u chip=%u plane=%u physical_block=virtual_block_x2_plus_plane\n",
+				   component, scan->component_chip[component],
+				   scan->component_plane[component]);
+		return 0;
+	}
+
+	block = ((struct g338_marker_sample *)item - scan->samples) /
+		(scan->component_count * G338_PAGE_POSITIONS);
+	if (!g338_block_needs_review(scan, block))
+		return 0;
+	seq_printf(seq,
+		   "review_block=%u virtual_addr=0x%llx proposed_factory_entry=none\n",
+		   block, (unsigned long long)block * mtd->erasesize);
+	for (component = 0; component < scan->component_count; component++) {
+		physical_block = block * G338_EXPECTED_PLANES +
+				 scan->component_plane[component];
+		for (page_position = 0;
+		     page_position < G338_PAGE_POSITIONS; page_position++) {
+			sample = &scan->samples[g338_sample_index(scan, block,
+					component, page_position)];
+			candidate = sample->stable && sample->marker != 0xff;
+			seq_printf(seq,
+				   "point=%s component=%u chip=%u plane=%u physical_block=%u "
+				   "physical_page=%u error=%d data0=%02x marker=%02x "
+				   "verify_error=%d verify_data0=%02x verify_marker=%02x "
+				   "stable=%u candidate=%u\n",
+				   page_position ? "last" : "first", component,
+				   scan->component_chip[component],
+				   scan->component_plane[component], physical_block,
+				   sample->physical_page, sample->error, sample->data0,
+				   sample->marker, sample->verify_error,
+				   sample->verify_data0, sample->verify_marker,
+				   sample->stable, candidate);
+		}
+	}
+	return 0;
+}
+
+static void *g338_physical_bbt_start(struct seq_file *seq, loff_t *pos)
+{
+	struct g338_scan_state *scan = seq->private;
+
+	if (*pos == 0)
+		return SEQ_START_TOKEN;
+	if (*pos > scan->total_blocks)
+		return NULL;
+	return &scan->samples[(*pos - 1) * scan->component_count *
+			     G338_PAGE_POSITIONS];
+}
+
+static void *g338_physical_bbt_next(struct seq_file *seq, void *item,
+				    loff_t *pos)
+{
+	struct g338_scan_state *scan = seq->private;
+
+	(void)item;
+	(*pos)++;
+	if (*pos > scan->total_blocks)
+		return NULL;
+	return &scan->samples[(*pos - 1) * scan->component_count *
+			     G338_PAGE_POSITIONS];
+}
+
+static void g338_physical_bbt_stop(struct seq_file *seq, void *item)
+{
+	(void)seq;
+	(void)item;
+}
+
+static const struct seq_operations g338_physical_bbt_seq_ops = {
+	.start = g338_physical_bbt_start,
+	.next = g338_physical_bbt_next,
+	.stop = g338_physical_bbt_stop,
+	.show = g338_physical_bbt_show,
+};
+
+static int g338_physical_bbt_open(struct inode *inode, struct file *file)
+{
+	struct g338_scan_state *scan;
+	struct seq_file *seq;
+	int error;
+
+	if (atomic_cmpxchg(&g338_scan_open, 0, 1))
+		return -EBUSY;
+	scan = kzalloc(sizeof(*scan), GFP_KERNEL);
+	if (!scan)
+		goto clear_open;
+	scan->aml_chip = PDE(inode)->data;
+	error = g338_scan_nand(scan);
+	if (error)
+		goto free_scan;
+	error = seq_open(file, &g338_physical_bbt_seq_ops);
+	if (error)
+		goto free_scan;
+	seq = file->private_data;
+	seq->private = scan;
+	return 0;
+
+free_scan:
+	vfree(scan->samples);
+	kfree(scan);
+	atomic_set(&g338_scan_open, 0);
+	return error;
+
+clear_open:
+	atomic_set(&g338_scan_open, 0);
+	return -ENOMEM;
+}
+
+static int g338_physical_bbt_release(struct inode *inode, struct file *file)
+{
+	struct seq_file *seq = file->private_data;
+	struct g338_scan_state *scan = seq->private;
+
+	vfree(scan->samples);
+	kfree(scan);
+	atomic_set(&g338_scan_open, 0);
+	return seq_release(inode, file);
+}
+
+static const struct file_operations g338_physical_bbt_fops = {
+	.owner = THIS_MODULE,
+	.open = g338_physical_bbt_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = g338_physical_bbt_release,
+};
+
 int aml_nand_init(struct aml_nand_chip *aml_chip)
 {
 	struct aml_nand_platform *plat = aml_chip->platform;
@@ -8051,6 +8531,13 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 		else
 			printk(KERN_INFO
 				"G336 rescue: read-only OOB-only BBT diagnostic ready\n");
+		if (!proc_create_data("g338_physical_bbt", S_IRUGO, NULL,
+				      &g338_physical_bbt_fops, aml_chip))
+			printk(KERN_ERR
+				"G338 rescue: failed to create Micron PIO factory-marker diagnostic\n");
+		else
+			printk(KERN_INFO
+				"G338 rescue: read-only Micron PIO factory-marker diagnostic ready\n");
 	}
 
 	if (aml_nand_add_partition(aml_chip) != 0) {

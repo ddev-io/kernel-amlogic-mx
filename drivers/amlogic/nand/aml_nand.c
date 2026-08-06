@@ -28,6 +28,7 @@
 #include <linux/mtd/partitions.h>
 
 #include <mach/nand.h>
+#include "g339_service_bbt.h"
 /*
  * CONFIG_SYS_NAND_RESET_CNT is used as a timeout mechanism when resetting
  * a flash.  NAND flash is initialized prior to interrupts so standard timers
@@ -8051,6 +8052,7 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 		else
 			printk(KERN_INFO
 				"G336 rescue: read-only OOB-only BBT diagnostic ready\n");
+		g339_service_bbt_register(aml_chip);
 	}
 
 	if (aml_nand_add_partition(aml_chip) != 0) {

@@ -6122,6 +6122,70 @@ static int aml_nand_update_env(struct mtd_info *mtd)
 	return -EPERM;
 }
 
+#define G342_CORRUPT_BBT_CRC	0x0171b3b7U
+#define G342_EXPECTED_BLOCKS	2048
+#define G342_EXPECTED_START_BLOCK	2
+#define G342_EXPECTED_ERASE_SIZE	0x00800000U
+#define G342_EXPECTED_WRITE_SIZE	0x00008000U
+#define G342_EXPECTED_MTD_SIZE	0x400000000ULL
+
+static int g342_is_known_corrupt_bbt(struct aml_nand_chip *aml_chip,
+				     struct mtd_info *mtd,
+				     struct aml_nand_bbt_info *bbt,
+				     int start_blk, int total_blk)
+{
+	u32 bbt_crc;
+	unsigned int entries = 0;
+	unsigned int factory = 0;
+	unsigned int runtime = 0;
+	unsigned int out_of_range = 0;
+	unsigned int parts = 0;
+	unsigned int i;
+
+	if (mtd->size != G342_EXPECTED_MTD_SIZE ||
+	    mtd->erasesize != G342_EXPECTED_ERASE_SIZE ||
+	    mtd->writesize != G342_EXPECTED_WRITE_SIZE ||
+	    aml_chip->plane_num != 2 ||
+	    start_blk != G342_EXPECTED_START_BLOCK ||
+	    total_blk != G342_EXPECTED_BLOCKS)
+		return 0;
+	if (memcmp(bbt->bbt_head_magic, BBT_HEAD_MAGIC, 4) ||
+	    memcmp(bbt->bbt_tail_magic, BBT_TAIL_MAGIC, 4))
+		return 0;
+
+	for (i = 0; i < MAX_BAD_BLK_NUM; i++) {
+		u16 value = (u16)bbt->nand_bbt[i];
+
+		if (!value)
+			continue;
+		entries++;
+		if (value & 0x8000)
+			factory++;
+		else
+			runtime++;
+		if ((value & 0x7fff) >= total_blk)
+			out_of_range++;
+	}
+	for (i = 0; i < MAX_MTD_PART_NUM; i++) {
+		if (!memcmp(bbt->aml_nand_part[i].mtd_part_magic,
+			    MTD_PART_MAGIC, 4))
+			parts++;
+	}
+
+	bbt_crc = crc32((0 ^ 0xffffffffL), (u8 *)bbt,
+			sizeof(*bbt)) ^ 0xffffffffL;
+	if (bbt_crc != G342_CORRUPT_BBT_CRC ||
+	    entries != MAX_BAD_BLK_NUM ||
+	    factory != MAX_BAD_BLK_NUM || runtime || out_of_range || parts)
+		return 0;
+
+	printk(KERN_WARNING
+		"G342 rescue: known corrupt BBT matched crc=0x%08x "
+		"entries=%u factory=%u; bypassing only in RAM\n",
+		bbt_crc, entries, factory);
+	return 1;
+}
+
 static int aml_nand_env_check(struct mtd_info *mtd)
 {
 	struct aml_nand_chip *aml_chip = mtd_to_nand_chip(mtd);
@@ -6164,20 +6228,26 @@ static int aml_nand_env_check(struct mtd_info *mtd)
 		total_blk = (int)(mtd->size >> phys_erase_shift);
 		nand_bbt_info = (struct aml_nand_bbt_info *)(env_ptr->data + default_environment_size);
 		if ((!memcmp(nand_bbt_info->bbt_head_magic, BBT_HEAD_MAGIC, 4)) && (!memcmp(nand_bbt_info->bbt_tail_magic, BBT_TAIL_MAGIC, 4))) {
-			for (i=start_blk; i<total_blk; i++) {
-				aml_chip->block_status[i] = NAND_BLOCK_GOOD;
-				for (j=0; j<MAX_BAD_BLK_NUM; j++) {
-					if ((nand_bbt_info->nand_bbt[j] &0x7fff)== i) {    
-					
-						if((nand_bbt_info->nand_bbt[j] &0x8000)) {
-						    aml_chip->block_status[i] = NAND_FACTORY_BAD;	
-							//printk("aml_nand_env_check init the block_status factory bbt blk=%d,aml_chip->block_status[%d] =%d\n",i,i,aml_chip->block_status[i]);
+			if (g342_is_known_corrupt_bbt(aml_chip, mtd, nand_bbt_info,
+						     start_blk, total_blk)) {
+				memset(aml_chip->block_status + start_blk,
+				       NAND_BLOCK_GOOD, total_blk - start_blk);
+			} else {
+				for (i=start_blk; i<total_blk; i++) {
+					aml_chip->block_status[i] = NAND_BLOCK_GOOD;
+					for (j=0; j<MAX_BAD_BLK_NUM; j++) {
+						if ((nand_bbt_info->nand_bbt[j] &0x7fff)== i) {
+
+							if((nand_bbt_info->nand_bbt[j] &0x8000)) {
+							    aml_chip->block_status[i] = NAND_FACTORY_BAD;
+								//printk("aml_nand_env_check init the block_status factory bbt blk=%d,aml_chip->block_status[%d] =%d\n",i,i,aml_chip->block_status[i]);
+							}
+							else{
+							    aml_chip->block_status[i] = NAND_BLOCK_BAD;
+								//printk("aml_nand_env_check init the block_status bbt blk=%d\n",i);
+							}
+							break;
 						}
-						else{
-						    aml_chip->block_status[i] = NAND_BLOCK_BAD;
-							//printk("aml_nand_env_check init the block_status bbt blk=%d\n",i);
-						}
-						break;
 					}
 				}
 			}
@@ -8055,7 +8125,8 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 			printk(KERN_INFO
 				"G336 rescue: read-only OOB-only BBT diagnostic ready\n");
 		g339_service_bbt_register(aml_chip);
-		g341_ecc_health_register(aml_chip);
+		printk(KERN_INFO
+			"G342 rescue: verified G341 full ECC rescan disabled\n");
 	}
 
 	if (aml_nand_add_partition(aml_chip) != 0) {

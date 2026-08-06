@@ -37,7 +37,7 @@
 #define G343_NEW_TIMESTAMP           2U
 #define G343_EXPECTED_PARTS          9U
 #define G343_NEW_BBT_CRC             0xacbcfcadU
-#define G343_COMMAND                 "append-empty-bbt-crc-0171b3b7-page-2"
+#define G343_COMMAND                 "append-empty-bbt-crc-0171b3b7-page-2-g344"
 
 struct g343_part_expect {
 	const char *name;
@@ -59,7 +59,8 @@ static const struct g343_part_expect g343_record_parts[G343_EXPECTED_PARTS] = {
 	{ "NFTL_Part", MTDPART_OFS_APPEND, MTDPART_SIZ_FULL },
 };
 
-/* These are the post-add_partition() values observed in the stock layout. */
+/* These are the post-add_partition() values in the platform table.  The MTD
+ * slave expands the final FULL-size sentinel without changing this table. */
 static const struct g343_part_expect g343_runtime_parts[G343_EXPECTED_PARTS] = {
 	{ "logo",      0x02000000ULL, 0x00800000ULL },
 	{ "aml_logo",  0x02800000ULL, 0x00800000ULL },
@@ -69,7 +70,7 @@ static const struct g343_part_expect g343_runtime_parts[G343_EXPECTED_PARTS] = {
 	{ "factory",   0x34000000ULL, 0x08000000ULL },
 	{ "cache",     0x3c000000ULL, 0x08000000ULL },
 	{ "userdata",  0x44000000ULL, 0x90000000ULL },
-	{ "NFTL_Part", 0xd4000000ULL, 0x32c000000ULL },
+	{ "NFTL_Part", 0xd4000000ULL, MTDPART_SIZ_FULL },
 };
 
 struct g343_state {
@@ -262,8 +263,14 @@ static int g343_validate_source_parts(struct g343_state *state)
 		    strcmp(part->name, g343_runtime_parts[i].name) ||
 		    part->offset != g343_runtime_parts[i].offset ||
 		    part->size != g343_runtime_parts[i].size ||
-		    part->mask_flags != MTD_WRITEABLE)
+		    part->mask_flags != MTD_WRITEABLE) {
+			printk(KERN_ERR
+			       "G344 rescue: partition preflight mismatch index=%u "
+			       "name=%s offset=0x%llx size=0x%llx mask=0x%x\n",
+			       i, part->name ? part->name : "<null>", part->offset,
+			       part->size, part->mask_flags);
 			return -EINVAL;
+		}
 	}
 	return 0;
 }
@@ -295,7 +302,7 @@ static void g343_build_new_record(struct g343_state *state)
 	state->new_bbt_crc = g343_crc(bbt, sizeof(*bbt));
 	if (state->new_bbt_crc != G343_NEW_BBT_CRC)
 		printk(KERN_ERR
-		       "G343 rescue: unexpected generated BBT CRC 0x%08x\n",
+		       "G344 rescue: unexpected generated BBT CRC 0x%08x\n",
 		       state->new_bbt_crc);
 	memset(&state->new_oob, 0, sizeof(state->new_oob));
 	memcpy(state->new_oob.name, ENV_NAND_MAGIC, 4);
@@ -500,7 +507,7 @@ static int g343_show(struct seq_file *seq, void *unused)
 		preflight = state->preflight_result;
 	}
 	seq_printf(seq,
-		"g343=one_shot_append_only target=0x%llx block=%u page=%u "
+		"g344=one_shot_append_only target=0x%llx block=%u page=%u "
 		"erase=disabled markbad=disabled general_write=disabled\n",
 		G343_TARGET_ADDR, G343_ENV_BLOCK, G343_TARGET_PAGE);
 	seq_printf(seq,
@@ -577,7 +584,7 @@ static ssize_t g343_write(struct file *file, const char __user *buffer,
 	state->success = 1;
 	error = count;
 	printk(KERN_ALERT
-	       "G343 rescue: append-only BBT restore verified at 0x%llx\n",
+	       "G344 rescue: append-only BBT restore verified at 0x%llx\n",
 	       G343_TARGET_ADDR);
 out:
 	mutex_unlock(&state->lock);
@@ -641,14 +648,14 @@ int g343_bbt_restore_register(struct aml_nand_chip *aml_chip)
 		return -ENOMEM;
 	}
 	g343_singleton = state;
-	if (!proc_create_data("g343_bbt_restore", S_IRUSR | S_IWUSR, NULL,
+	if (!proc_create_data("g344_bbt_restore", S_IRUSR | S_IWUSR, NULL,
 			      &g343_fops, state)) {
 		g343_singleton = NULL;
 		g343_free_state(state);
 		return -ENOMEM;
 	}
 	printk(KERN_WARNING
-	       "G343 rescue: one-shot append-only BBT restore control ready; "
+	       "G344 rescue: one-shot append-only BBT restore control ready; "
 	       "no write is automatic\n");
 	return 0;
 }

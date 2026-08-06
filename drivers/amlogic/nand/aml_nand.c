@@ -3381,12 +3381,12 @@ static int aml_nand_write_page(struct mtd_info *mtd, struct nand_chip *chip, con
 	if (!g343_bbt_write_gate_take(mtd, buf, chip->oob_poi, page,
 					 cached, raw)) {
 		printk(KERN_WARNING
-			"G343 rescue: low-level NAND page write blocked at page %d\n",
+			"G344 rescue: low-level NAND page write blocked at page %d\n",
 			page);
 		return -EPERM;
 	}
 	printk(KERN_WARNING
-		"G343 rescue: one-shot BBT journal page write accepted at page %d\n",
+		"G344 rescue: one-shot BBT journal page write accepted at page %d\n",
 		page);
 
 	chip->cmdfunc(mtd, NAND_CMD_SEQIN, 0x00, page);

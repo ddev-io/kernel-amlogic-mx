@@ -686,6 +686,7 @@ static int m3_nand_hwecc_correct(struct aml_nand_chip *aml_chip, unsigned char *
 	struct nand_chip *chip = &aml_chip->chip;
 	unsigned ecc_step_num;
 	unsigned info_times_int_len = PER_INFO_BYTE/sizeof(unsigned int);
+	unsigned ecc_count;
 
 	if (size % chip->ecc.size) {
 		printk ("error parameter size for ecc correct %x\n", size);
@@ -695,7 +696,8 @@ static int m3_nand_hwecc_correct(struct aml_nand_chip *aml_chip, unsigned char *
 	aml_chip->ecc_cnt_cur = 0;
 	 for (ecc_step_num = 0; ecc_step_num < (size / chip->ecc.size); ecc_step_num++) {
 	 	//check if there have uncorrectable sector
-		if(NAND_ECC_CNT(aml_read_reg32((unsigned )(&aml_chip->user_info_buf[ecc_step_num*info_times_int_len]))) == 0x3f)
+		ecc_count = NAND_ECC_CNT(aml_read_reg32((unsigned )(&aml_chip->user_info_buf[ecc_step_num*info_times_int_len])));
+		if(ecc_count == 0x3f)
 		{
             		aml_chip->zero_cnt = NAND_ZERO_CNT(*(unsigned *)(&aml_chip->user_info_buf[ecc_step_num*info_times_int_len]));
 			//printk ("nand communication have uncorrectable ecc error %d\n", ecc_step_num);
@@ -703,7 +705,9 @@ static int m3_nand_hwecc_correct(struct aml_nand_chip *aml_chip, unsigned char *
 	 	}
 	 	else {
 			//mtd->ecc_stats.corrected += NAND_ECC_CNT(*(unsigned *)(&aml_chip->user_info_buf[ecc_step_num*info_times_int_len]));
-			aml_chip->ecc_cnt_cur = NAND_ECC_CNT(*(unsigned *)(&aml_chip->user_info_buf[ecc_step_num*info_times_int_len]));
+			aml_chip->ecc_cnt_cur = ecc_count;
+			if (ecc_count > aml_chip->diag_ecc_page_max)
+				aml_chip->diag_ecc_page_max = ecc_count;
 		}
 	}
 

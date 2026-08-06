@@ -29,6 +29,7 @@
 
 #include <mach/nand.h>
 #include "g339_service_bbt.h"
+#include "g341_ecc_health.h"
 /*
  * CONFIG_SYS_NAND_RESET_CNT is used as a timeout mechanism when resetting
  * a flash.  NAND flash is initialized prior to interrupts so standard timers
@@ -2983,6 +2984,7 @@ static int aml_nand_read_page_hwecc(struct mtd_info *mtd, struct nand_chip *chip
 	int ran_mode = aml_chip->ran_mode;
 #endif
 	int retry_cnt =aml_chip->new_nand_info.read_rety_info.retry_cnt;
+	aml_chip->diag_ecc_page_max = 0;
 	if ((aml_chip->new_nand_info.type == HYNIX_20NM_8GB) || (aml_chip->new_nand_info.type == HYNIX_20NM_4GB)|| (aml_chip->new_nand_info.type == HYNIX_1YNM_8GB))
 		retry_cnt = aml_chip->new_nand_info.read_rety_info.retry_cnt *aml_chip->new_nand_info.read_rety_info.retry_cnt;
 
@@ -8053,6 +8055,7 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 			printk(KERN_INFO
 				"G336 rescue: read-only OOB-only BBT diagnostic ready\n");
 		g339_service_bbt_register(aml_chip);
+		g341_ecc_health_register(aml_chip);
 	}
 
 	if (aml_nand_add_partition(aml_chip) != 0) {

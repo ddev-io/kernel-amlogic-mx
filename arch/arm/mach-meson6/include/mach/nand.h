@@ -669,6 +669,7 @@ struct aml_nand_chip {
 	u8 ecc_cnt_limit;
 	u8 ecc_cnt_cur;
 	u8 ecc_max;
+	u8 diag_ecc_page_max;
 	unsigned int 		 toggle_mode;
     unsigned zero_cnt;
 	unsigned oob_fill_cnt;

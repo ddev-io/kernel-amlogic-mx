@@ -37,7 +37,7 @@
 #define G343_NEW_TIMESTAMP           2U
 #define G343_EXPECTED_PARTS          9U
 #define G343_NEW_BBT_CRC             0xacbcfcadU
-#define G343_COMMAND                 "append-empty-bbt-crc-0171b3b7-page-2-g344"
+#define G343_COMMAND                 "append-empty-bbt-crc-0171b3b7-page-2-g345"
 
 struct g343_part_expect {
 	const char *name;
@@ -265,7 +265,7 @@ static int g343_validate_source_parts(struct g343_state *state)
 		    part->size != g343_runtime_parts[i].size ||
 		    part->mask_flags != MTD_WRITEABLE) {
 			printk(KERN_ERR
-			       "G344 rescue: partition preflight mismatch index=%u "
+			       "G345 rescue: partition preflight mismatch index=%u "
 			       "name=%s offset=0x%llx size=0x%llx mask=0x%x\n",
 			       i, part->name ? part->name : "<null>", part->offset,
 			       part->size, part->mask_flags);
@@ -302,7 +302,7 @@ static void g343_build_new_record(struct g343_state *state)
 	state->new_bbt_crc = g343_crc(bbt, sizeof(*bbt));
 	if (state->new_bbt_crc != G343_NEW_BBT_CRC)
 		printk(KERN_ERR
-		       "G344 rescue: unexpected generated BBT CRC 0x%08x\n",
+		       "G345 rescue: unexpected generated BBT CRC 0x%08x\n",
 		       state->new_bbt_crc);
 	memset(&state->new_oob, 0, sizeof(state->new_oob));
 	memcpy(state->new_oob.name, ENV_NAND_MAGIC, 4);
@@ -359,7 +359,8 @@ static int g343_preflight(struct g343_state *state)
 	if (g343_validate_old_oob(&state->old0_oob) ||
 	    g343_validate_old_bbt(state, (env_t *)state->old0))
 		return -EINVAL;
-	if (memcmp(state->old0, state->old1, 0x6ccc))
+	if (memcmp(((env_t *)state->old0)->data,
+		   ((env_t *)state->old1)->data, 0x6ccc))
 		return -EINVAL;
 	error = g343_read_page(state, G343_TARGET_PAGE,
 				state->empty0, &state->empty0_oob);
@@ -390,7 +391,8 @@ static int g343_preflight(struct g343_state *state)
 	g343_build_new_record(state);
 	if (state->new_bbt_crc != G343_NEW_BBT_CRC)
 		return -EINVAL;
-	if (memcmp(state->new_record, state->old1, 0x6ccc))
+	if (memcmp(((env_t *)state->new_record)->data,
+		   ((env_t *)state->old1)->data, 0x6ccc))
 		return -EINVAL;
 	state->preflight_complete = 1;
 	return 0;
@@ -507,7 +509,7 @@ static int g343_show(struct seq_file *seq, void *unused)
 		preflight = state->preflight_result;
 	}
 	seq_printf(seq,
-		"g344=one_shot_append_only target=0x%llx block=%u page=%u "
+		"g345=one_shot_append_only target=0x%llx block=%u page=%u "
 		"erase=disabled markbad=disabled general_write=disabled\n",
 		G343_TARGET_ADDR, G343_ENV_BLOCK, G343_TARGET_PAGE);
 	seq_printf(seq,
@@ -584,7 +586,7 @@ static ssize_t g343_write(struct file *file, const char __user *buffer,
 	state->success = 1;
 	error = count;
 	printk(KERN_ALERT
-	       "G344 rescue: append-only BBT restore verified at 0x%llx\n",
+	       "G345 rescue: append-only BBT restore verified at 0x%llx\n",
 	       G343_TARGET_ADDR);
 out:
 	mutex_unlock(&state->lock);
@@ -648,14 +650,14 @@ int g343_bbt_restore_register(struct aml_nand_chip *aml_chip)
 		return -ENOMEM;
 	}
 	g343_singleton = state;
-	if (!proc_create_data("g344_bbt_restore", S_IRUSR | S_IWUSR, NULL,
+	if (!proc_create_data("g345_bbt_restore", S_IRUSR | S_IWUSR, NULL,
 			      &g343_fops, state)) {
 		g343_singleton = NULL;
 		g343_free_state(state);
 		return -ENOMEM;
 	}
 	printk(KERN_WARNING
-	       "G344 rescue: one-shot append-only BBT restore control ready; "
+	       "G345 rescue: one-shot append-only BBT restore control ready; "
 	       "no write is automatic\n");
 	return 0;
 }

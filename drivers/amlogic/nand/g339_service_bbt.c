@@ -1,4 +1,4 @@
-/* Read-only recovery of historic Amlogic BBT copies from NAND key records. */
+/* Read-only recovery of historic Amlogic BBT copies from service records. */
 
 #include <linux/atomic.h>
 #include <linux/crc32.h>
@@ -19,13 +19,15 @@
 
 /*
  * Do not call the normal key or secure initializers here.  Their error paths
- * can erase, rewrite, or mark service blocks bad.  G339 only issues read_oob.
+ * can erase, rewrite, or mark service blocks bad.  G340 only issues read_oob.
  *
  * The key record is 64 KiB: a four-byte CRC followed by a 0xfffc-byte payload.
  * struct aml_nand_bbt_info occupies the payload tail.  On this G04, one record
  * is two 32-KiB virtual pages and the BBT starts at 0x6cd0 of page two.
  */
-#define G339_TAIL_BLOCKS             16
+#define G340_EARLY_START_BLOCK       2
+#define G340_EARLY_END_BLOCK         64
+#define G340_TAIL_BLOCKS             16
 #define G339_KEY_RECORD_SIZE         0x10000
 #define G339_KEY_PAYLOAD_SIZE        (G339_KEY_RECORD_SIZE - sizeof(u32))
 #define G339_MAX_UNIQUE_BBTS         64
@@ -39,6 +41,8 @@ struct g339_bbt_candidate {
 	u32 stable_occurrences;
 	u32 exact_key_occurrences;
 	u32 key_magic_occurrences;
+	u32 env_magic_occurrences;
+	u32 secure_magic_occurrences;
 	u32 outer_crc_checked;
 	u32 outer_crc_ok;
 	u32 first_stored_crc;
@@ -63,6 +67,8 @@ struct g339_scan_state {
 	struct g339_bbt_candidate *candidates;
 	unsigned int total_blocks;
 	unsigned int start_block;
+	unsigned int early_end_block;
+	unsigned int tail_start_block;
 	unsigned int pages_per_block;
 	unsigned int bbt_page_offset;
 	unsigned int scan_pages;
@@ -70,6 +76,7 @@ struct g339_scan_state {
 	unsigned int read_errors;
 	unsigned int euclean_reads;
 	unsigned int key_magic_pages;
+	unsigned int env_magic_pages;
 	unsigned int secure_magic_pages;
 	unsigned int head_hits;
 	unsigned int cross_page_hits;
@@ -153,6 +160,8 @@ static void g339_record_candidate(struct g339_scan_state *scan,
 				  unsigned int offset, unsigned int stable,
 				  unsigned int exact_key,
 				  unsigned int key_magic,
+				  unsigned int env_magic,
+				  unsigned int secure_magic,
 				  unsigned int timestamp,
 				  unsigned int outer_checked,
 				  unsigned int outer_ok, u32 stored_crc,
@@ -203,6 +212,8 @@ update:
 		}
 		candidate->key_magic_occurrences++;
 	}
+	candidate->env_magic_occurrences += !!env_magic;
+	candidate->secure_magic_occurrences += !!secure_magic;
 }
 
 static int g339_scan_nand(struct g339_scan_state *scan)
@@ -217,9 +228,9 @@ static int g339_scan_nand(struct g339_scan_state *scan)
 	u8 verify_oob[sizeof(struct env_oobinfo_t)];
 	u8 previous_oob[sizeof(struct env_oobinfo_t)];
 	u8 *cursor, *hit, *end;
-	u32 secure_magic, stored_crc, calculated_crc;
+	u32 secure_magic_value, stored_crc, calculated_crc;
 	unsigned int block, page, offset, timestamp;
-	unsigned int key_magic, stable, exact_key;
+	unsigned int key_magic, env_magic, secure_magic, stable, exact_key;
 	unsigned int outer_checked, outer_ok;
 	unsigned int bbt_record_offset;
 	int error, verify_error, previous_error;
@@ -233,8 +244,12 @@ static int g339_scan_nand(struct g339_scan_state *scan)
 	scan->total_blocks = div_u64(mtd->size, mtd->erasesize);
 	if (!scan->total_blocks || scan->pages_per_block < 2)
 		return -EINVAL;
-	scan->start_block = scan->total_blocks > G339_TAIL_BLOCKS ?
-			    scan->total_blocks - G339_TAIL_BLOCKS : 0;
+	scan->start_block = min_t(unsigned int, G340_EARLY_START_BLOCK,
+				  scan->total_blocks);
+	scan->early_end_block = min_t(unsigned int, G340_EARLY_END_BLOCK,
+				      scan->total_blocks);
+	scan->tail_start_block = scan->total_blocks > G340_TAIL_BLOCKS ?
+				 scan->total_blocks - G340_TAIL_BLOCKS : 0;
 	bbt_record_offset = sizeof(u32) + G339_KEY_PAYLOAD_SIZE -
 			    sizeof(struct aml_nand_bbt_info);
 	scan->bbt_page_offset = bbt_record_offset - mtd->writesize;
@@ -252,10 +267,15 @@ static int g339_scan_nand(struct g339_scan_state *scan)
 	}
 
 	printk(KERN_INFO
-	       "G339 scan: read-only key/secure tail blocks %u..%u\n",
-	       scan->start_block, scan->total_blocks - 1);
+	       "G340 scan: read-only service blocks %u..%u and %u..%u\n",
+	       scan->start_block,
+	       scan->early_end_block ? scan->early_end_block - 1 : 0,
+	       scan->tail_start_block, scan->total_blocks - 1);
 	for (block = scan->start_block; block < scan->total_blocks; block++) {
-		for (page = 1; page < scan->pages_per_block; page += 2) {
+		if (block >= scan->early_end_block &&
+		    block < scan->tail_start_block)
+			continue;
+		for (page = 0; page < scan->pages_per_block; page++) {
 			scan->scan_pages++;
 			error = g339_read_page(scan, block, page, page_data,
 					       page_oob);
@@ -263,10 +283,15 @@ static int g339_scan_nand(struct g339_scan_state *scan)
 				continue;
 			oobinfo = (struct env_oobinfo_t *)page_oob;
 			key_magic = !memcmp(oobinfo->name, G339_KEY_MAGIC, 4);
+			env_magic = !memcmp(oobinfo->name, ENV_NAND_MAGIC, 4);
 			if (key_magic)
 				scan->key_magic_pages++;
-			memcpy(&secure_magic, page_oob, sizeof(secure_magic));
-			if (secure_magic == G339_SECURE_MAGIC)
+			if (env_magic)
+				scan->env_magic_pages++;
+			memcpy(&secure_magic_value, page_oob,
+			       sizeof(secure_magic_value));
+			secure_magic = secure_magic_value == G339_SECURE_MAGIC;
+			if (secure_magic)
 				scan->secure_magic_pages++;
 
 			cursor = page_data;
@@ -302,7 +327,8 @@ static int g339_scan_nand(struct g339_scan_state *scan)
 				if (!stable)
 					scan->unstable_hits++;
 
-				exact_key = offset == scan->bbt_page_offset;
+				exact_key = key_magic && page > 0 &&
+					offset == scan->bbt_page_offset;
 				outer_checked = 0;
 				outer_ok = 0;
 				stored_crc = 0;
@@ -333,7 +359,8 @@ static int g339_scan_nand(struct g339_scan_state *scan)
 				timestamp = key_magic ? oobinfo->timestamp : 0;
 				g339_record_candidate(scan, bbt, block, page,
 						      offset, stable, exact_key,
-						      key_magic, timestamp,
+						      key_magic, env_magic,
+						      secure_magic, timestamp,
 						      outer_checked, outer_ok,
 						      stored_crc,
 						      calculated_crc);
@@ -342,7 +369,7 @@ static int g339_scan_nand(struct g339_scan_state *scan)
 	}
 	error = 0;
 	printk(KERN_INFO
-	       "G339 scan: complete pages=%u reads=%u errors=%u valid_hits=%u unique=%u\n",
+	       "G340 scan: complete pages=%u reads=%u errors=%u valid_hits=%u unique=%u\n",
 	       scan->scan_pages, scan->total_reads, scan->read_errors,
 	       scan->valid_bbt_hits, scan->unique_candidates);
 
@@ -363,25 +390,28 @@ static int g339_service_bbt_show(struct seq_file *seq, void *unused)
 
 	(void)unused;
 	seq_printf(seq,
-		"g339=read_only scan=tail_key_secure exact_key_format=64k_two_page "
+		"g340=read_only scan=early_and_tail_all_pages exact_key_format=64k_two_page "
 		"no_block_status=1 no_block_isbad=1 no_key_init=1 no_secure_init=1 "
 		"no_write=1\n");
 	seq_printf(seq,
-		"scan_error=%d start_block=%u end_block=%u total_blocks=%u "
+		"scan_error=%d early_start=%u early_end=%u tail_start=%u "
+		"tail_end=%u total_blocks=%u "
 		"pages_per_block=%u bbt_second_page_offset=0x%x\n",
 		scan->scan_error, scan->start_block,
+		scan->early_end_block ? scan->early_end_block - 1 : 0,
+		scan->tail_start_block,
 		scan->total_blocks ? scan->total_blocks - 1 : 0,
 		scan->total_blocks, scan->pages_per_block,
 		scan->bbt_page_offset);
 	seq_printf(seq,
 		"summary scan_pages=%u total_reads=%u read_errors=%u euclean_reads=%u "
-		"key_magic_pages=%u secure_magic_pages=%u head_hits=%u "
+		"key_magic_pages=%u env_magic_pages=%u secure_magic_pages=%u head_hits=%u "
 		"cross_page_hits=%u invalid_tail_hits=%u valid_bbt_hits=%u "
 		"unstable_hits=%u exact_key_hits=%u outer_crc_checked=%u "
 		"outer_crc_ok=%u unique_candidates=%u dropped_candidates=%u\n",
 		scan->scan_pages, scan->total_reads, scan->read_errors,
 		scan->euclean_reads, scan->key_magic_pages,
-		scan->secure_magic_pages, scan->head_hits,
+		scan->env_magic_pages, scan->secure_magic_pages, scan->head_hits,
 		scan->cross_page_hits, scan->invalid_tail_hits,
 		scan->valid_bbt_hits, scan->unstable_hits,
 		scan->exact_key_hits, scan->outer_crc_checked,
@@ -392,7 +422,8 @@ static int g339_service_bbt_show(struct seq_file *seq, void *unused)
 		candidate = &scan->candidates[i];
 		seq_printf(seq,
 			"candidate=%u bbt_crc=0x%08x occurrences=%u stable=%u "
-			"exact_key=%u key_magic=%u outer_checked=%u outer_ok=%u "
+			"exact_key=%u key_magic=%u env_magic=%u secure_magic=%u "
+			"outer_checked=%u outer_ok=%u "
 			"first=%u:%u:0x%x last=%u:%u:0x%x timestamps=%u..%u "
 			"entries=%u factory=%u runtime=%u out_of_range=%u parts=%u "
 			"first_outer_stored=0x%08x first_outer_calc=0x%08x "
@@ -401,6 +432,8 @@ static int g339_service_bbt_show(struct seq_file *seq, void *unused)
 			candidate->stable_occurrences,
 			candidate->exact_key_occurrences,
 			candidate->key_magic_occurrences,
+			candidate->env_magic_occurrences,
+			candidate->secure_magic_occurrences,
 			candidate->outer_crc_checked, candidate->outer_crc_ok,
 			candidate->first_block, candidate->first_page,
 			candidate->first_offset, candidate->last_block,
@@ -487,13 +520,13 @@ static const struct file_operations g339_service_bbt_fops = {
 
 int g339_service_bbt_register(struct aml_nand_chip *aml_chip)
 {
-	if (!proc_create_data("g339_service_bbt", S_IRUGO, NULL,
+	if (!proc_create_data("g340_service_bbt", S_IRUGO, NULL,
 			      &g339_service_bbt_fops, aml_chip)) {
 		printk(KERN_ERR
-		       "G339 rescue: failed to create service BBT diagnostic\n");
+		       "G340 rescue: failed to create service BBT diagnostic\n");
 		return -ENOMEM;
 	}
 	printk(KERN_INFO
-	       "G339 rescue: read-only key/secure BBT diagnostic ready\n");
+	       "G340 rescue: read-only legacy/tail BBT diagnostic ready\n");
 	return 0;
 }

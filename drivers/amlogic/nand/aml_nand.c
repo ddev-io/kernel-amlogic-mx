@@ -15,6 +15,7 @@
 #include <linux/io.h>
 #include <linux/bitops.h>
 #include <linux/crc32.h>
+#include <linux/atomic.h>
 #include <linux/fs.h>
 #include <linux/math64.h>
 #include <linux/proc_fs.h>
@@ -2821,6 +2822,39 @@ static void aml_nand_dma_write_buf(struct mtd_info *mtd, const uint8_t *buf, int
 	aml_chip->aml_nand_dma_write(aml_chip, (unsigned char *)buf, len, 0);
 }
 
+/* G337 uses these only while its read-only raw OOB diagnostic owns mtd. */
+static int g337_raw_probe_active;
+static atomic_t g337_scan_open = ATOMIC_INIT(0);
+static struct aml_nand_chip *g337_raw_probe_chip;
+static u8 *g337_raw_probe_buffer;
+static u8 g337_raw_probe_fill;
+static u32 g337_raw_probe_dma_error_mask;
+
+static int aml_nand_read_raw_component(struct aml_nand_chip *aml_chip,
+				       unsigned int length,
+				       unsigned int component,
+				       int probe_active)
+{
+	int error;
+
+	if (probe_active) {
+		memset(aml_chip->aml_nand_data_buf, g337_raw_probe_fill, length);
+		wmb();
+	}
+	error = aml_chip->aml_nand_dma_read(aml_chip,
+					    aml_chip->aml_nand_data_buf,
+					    length, 0);
+	if (error && probe_active) {
+		if (component < 32)
+			g337_raw_probe_dma_error_mask |= 1U << component;
+		else
+			g337_raw_probe_dma_error_mask = ~0U;
+		return error;
+	}
+	/* Preserve the factory callback's behavior outside G337. */
+	return 0;
+}
+
 static int aml_nand_read_page_raw(struct mtd_info *mtd, struct nand_chip *chip, uint8_t *buf, int page)
 {
 	struct aml_nand_chip *aml_chip = mtd_to_nand_chip(mtd);
@@ -2828,6 +2862,10 @@ static int aml_nand_read_page_raw(struct mtd_info *mtd, struct nand_chip *chip, 
 	unsigned nand_oob_size = aml_chip->oob_size;
 	uint8_t *oob_buf = chip->oob_poi;
 	int i, error = 0, j = 0, page_addr, internal_chipnr = 1;
+	unsigned int component = 0;
+	int probe_active = g337_raw_probe_active &&
+		g337_raw_probe_chip == aml_chip &&
+		g337_raw_probe_buffer == buf;
 
 	if (aml_chip->ops_mode & AML_INTERLEAVING_MODE)
 		internal_chipnr = aml_chip->internal_chipnr;
@@ -2853,32 +2891,47 @@ static int aml_nand_read_page_raw(struct mtd_info *mtd, struct nand_chip *chip, 
 				if (aml_chip->ops_mode & AML_CHIP_NONE_RB) 
 					chip->cmd_ctrl(mtd, NAND_CMD_READ0 & 0xff, NAND_NCE | NAND_CLE | NAND_CTRL_CHANGE);
 
-				if (aml_chip->plane_num == 2) {
+					if (aml_chip->plane_num == 2) {
 
-					aml_chip->aml_nand_command(aml_chip, NAND_CMD_TWOPLANE_READ1, 0x00, page_addr, i);
-					aml_chip->aml_nand_dma_read(aml_chip, aml_chip->aml_nand_data_buf, nand_page_size + nand_oob_size, 0);
-					memcpy(buf, aml_chip->aml_nand_data_buf, (nand_page_size + nand_oob_size));
-					memcpy(oob_buf, aml_chip->aml_nand_data_buf + nand_page_size, nand_oob_size);
+						aml_chip->aml_nand_command(aml_chip, NAND_CMD_TWOPLANE_READ1, 0x00, page_addr, i);
+						error = aml_nand_read_raw_component(aml_chip,
+								nand_page_size + nand_oob_size,
+								component, probe_active);
+						if (error)
+							goto exit;
+						memcpy(buf, aml_chip->aml_nand_data_buf, (nand_page_size + nand_oob_size));
+						memcpy(oob_buf, aml_chip->aml_nand_data_buf + nand_page_size, nand_oob_size);
 
-					oob_buf += nand_oob_size;
-					buf += (nand_page_size + nand_oob_size);
+						oob_buf += nand_oob_size;
+						buf += (nand_page_size + nand_oob_size);
+						component++;
 
-					aml_chip->aml_nand_command(aml_chip, NAND_CMD_TWOPLANE_READ2, 0x00, page_addr, i);
-					aml_chip->aml_nand_dma_read(aml_chip, aml_chip->aml_nand_data_buf, nand_page_size + nand_oob_size, 0);
-					memcpy(buf, aml_chip->aml_nand_data_buf, (nand_page_size + nand_oob_size));
-					memcpy(oob_buf, aml_chip->aml_nand_data_buf + nand_page_size, nand_oob_size);
+						aml_chip->aml_nand_command(aml_chip, NAND_CMD_TWOPLANE_READ2, 0x00, page_addr, i);
+						error = aml_nand_read_raw_component(aml_chip,
+								nand_page_size + nand_oob_size,
+								component, probe_active);
+						if (error)
+							goto exit;
+						memcpy(buf, aml_chip->aml_nand_data_buf, (nand_page_size + nand_oob_size));
+						memcpy(oob_buf, aml_chip->aml_nand_data_buf + nand_page_size, nand_oob_size);
 
-					oob_buf += nand_oob_size;
-					buf += (nand_page_size + nand_oob_size);
-				}
-				else if (aml_chip->plane_num == 1) {
+						oob_buf += nand_oob_size;
+						buf += (nand_page_size + nand_oob_size);
+						component++;
+					}
+					else if (aml_chip->plane_num == 1) {
 
-					aml_chip->aml_nand_dma_read(aml_chip, aml_chip->aml_nand_data_buf, nand_page_size + nand_oob_size, 0);
-					memcpy(buf, aml_chip->aml_nand_data_buf, (nand_page_size + nand_oob_size));
-					memcpy(oob_buf, aml_chip->aml_nand_data_buf + nand_page_size, nand_oob_size);
+						error = aml_nand_read_raw_component(aml_chip,
+								nand_page_size + nand_oob_size,
+								component, probe_active);
+						if (error)
+							goto exit;
+						memcpy(buf, aml_chip->aml_nand_data_buf, (nand_page_size + nand_oob_size));
+						memcpy(oob_buf, aml_chip->aml_nand_data_buf + nand_page_size, nand_oob_size);
 
-					oob_buf += nand_oob_size;
-					buf += nand_page_size;
+						oob_buf += nand_oob_size;
+						buf += nand_page_size;
+						component++;
 				}
 				else {
 					error = -ENODEV;
@@ -6854,19 +6907,20 @@ static const struct file_operations g334_bbt_journal_fops = {
 	.release = single_release,
 };
 
-#define G336_SCAN_PAGES 2
-#define G336_MAX_COMPONENTS 32
+#define G337_SCAN_PAGES 2
+#define G337_MAX_COMPONENTS 32
+#define G337_EXPECTED_COMPONENTS 4
+#define G337_PHYSICAL_PAGE_BYTES 8192
+#define G337_PHYSICAL_OOB_BYTES 448
+#define G337_PHYSICAL_ERASE_BYTES (2 * 1024 * 1024)
 
-struct g336_page_sample {
+struct g337_page_sample {
 	s32 error;
 	s32 verify_error;
 	u32 retlen;
-	u32 oobretlen;
-	u32 verify_oobretlen;
-	u32 ecc_failed;
-	u32 ecc_corrected;
-	u32 verify_ecc_failed;
-	u32 verify_ecc_corrected;
+	u32 verify_retlen;
+	u32 dma_error_mask;
+	u32 verify_dma_error_mask;
 	u32 mismatch_bytes;
 	u32 marker_zero_mask;
 	u32 marker_nonff_mask;
@@ -6876,12 +6930,12 @@ struct g336_page_sample {
 	u8 valid;
 	u8 captured;
 	u8 stable;
-	u8 vendor_all_zero;
+	u8 raw_all_zero;
 };
 
-struct g336_scan_state {
+struct g337_scan_state {
 	struct aml_nand_chip *aml_chip;
-	struct g336_page_sample *samples;
+	struct g337_page_sample *samples;
 	u8 *oob;
 	u8 *verify_oob;
 	unsigned int total_blocks;
@@ -6890,18 +6944,20 @@ struct g336_scan_state {
 	unsigned int internal_count;
 	unsigned int segment_bytes;
 	unsigned int oob_bytes;
+	unsigned int raw_page_bytes;
+	unsigned int physical_page_bytes;
+	unsigned int physical_erase_bytes;
 	unsigned int marker_pos;
 	unsigned int valid_chip_mask;
 	unsigned int valid_chip_count;
-	unsigned int component_chip[G336_MAX_COMPONENTS];
-	unsigned int component_internal[G336_MAX_COMPONENTS];
-	unsigned int component_plane[G336_MAX_COMPONENTS];
+	unsigned int component_chip[G337_MAX_COMPONENTS];
+	unsigned int component_internal[G337_MAX_COMPONENTS];
+	unsigned int component_plane[G337_MAX_COMPONENTS];
 	unsigned int reads;
 	unsigned int read_errors;
-	unsigned int euclean_reads;
-	unsigned int ecc_failed_reads;
+	unsigned int dma_error_reads;
 	unsigned int unstable_reads;
-	unsigned int vendor_bad_blocks;
+	unsigned int raw_all_zero_blocks;
 	unsigned int component_zero_blocks;
 	unsigned int marker_only_blocks;
 	unsigned int marker_zero_blocks;
@@ -6909,39 +6965,30 @@ struct g336_scan_state {
 	unsigned int review_blocks;
 };
 
-static size_t g336_sample_index(const struct g336_scan_state *scan,
+static size_t g337_sample_index(const struct g337_scan_state *scan,
 				unsigned int block, unsigned int read_cnt)
 {
-	return ((size_t)block * G336_SCAN_PAGES) + read_cnt;
+	return ((size_t)block * G337_SCAN_PAGES) + read_cnt;
 }
 
-static u8 *g336_sample_oob(const struct g336_scan_state *scan,
+static u8 *g337_sample_oob(const struct g337_scan_state *scan,
 			  unsigned int block, unsigned int read_cnt)
 {
-	return scan->oob + g336_sample_index(scan, block, read_cnt) *
+	return scan->oob + g337_sample_index(scan, block, read_cnt) *
 			   scan->oob_bytes;
 }
 
-static u8 *g336_sample_verify_oob(const struct g336_scan_state *scan,
+static u8 *g337_sample_verify_oob(const struct g337_scan_state *scan,
 				 unsigned int block, unsigned int read_cnt)
 {
-	return scan->verify_oob + g336_sample_index(scan, block, read_cnt) *
+	return scan->verify_oob + g337_sample_index(scan, block, read_cnt) *
 				  scan->oob_bytes;
 }
 
-static u32 g336_byte_mask(unsigned int bytes)
-{
-	if (bytes >= 32)
-		return ~0U;
-	return (1U << bytes) - 1;
-}
-
-static void g336_classify_page(struct g336_scan_state *scan,
-			       struct g336_page_sample *sample, u8 *oob)
+static void g337_classify_page(struct g337_scan_state *scan,
+			       struct g337_page_sample *sample, u8 *oob)
 {
 	unsigned int component, byte;
-	u32 all_bytes = g336_byte_mask(scan->segment_bytes);
-	u32 marker_bit = 1U << scan->marker_pos;
 	int page_all_zero = 1;
 
 	for (byte = 0; byte < scan->oob_bytes; byte++) {
@@ -6950,34 +6997,34 @@ static void g336_classify_page(struct g336_scan_state *scan,
 			break;
 		}
 	}
-	sample->vendor_all_zero = page_all_zero;
+	sample->raw_all_zero = page_all_zero;
 
 	for (component = 0; component < scan->component_count; component++) {
 		u8 *segment = oob + component * scan->segment_bytes;
-		u32 zero_mask = 0;
-		u32 ff_mask = 0;
+		unsigned int zero_count = 0;
+		unsigned int ff_count = 0;
 
 		for (byte = 0; byte < scan->segment_bytes; byte++) {
 			if (segment[byte] == 0)
-				zero_mask |= 1U << byte;
+				zero_count++;
 			if (segment[byte] == 0xff)
-				ff_mask |= 1U << byte;
+				ff_count++;
 		}
 		if (segment[scan->marker_pos] == 0)
 			sample->marker_zero_mask |= 1U << component;
 		if (segment[scan->marker_pos] != 0xff)
 			sample->marker_nonff_mask |= 1U << component;
-		if (zero_mask == all_bytes)
+		if (zero_count == scan->segment_bytes)
 			sample->segment_zero_mask |= 1U << component;
-		if (ff_mask == all_bytes)
+		if (ff_count == scan->segment_bytes)
 			sample->segment_ff_mask |= 1U << component;
 		if ((segment[scan->marker_pos] == 0) &&
-		    ((ff_mask & ~marker_bit) == (all_bytes & ~marker_bit)))
+		    (ff_count == scan->segment_bytes - 1))
 			sample->marker_only_mask |= 1U << component;
 	}
 }
 
-static int g336_prepare_geometry(struct g336_scan_state *scan)
+static int g337_prepare_geometry(struct g337_scan_state *scan)
 {
 	struct aml_nand_chip *aml_chip = scan->aml_chip;
 	struct mtd_info *mtd = &aml_chip->mtd;
@@ -6985,6 +7032,8 @@ static int g336_prepare_geometry(struct g336_scan_state *scan)
 	unsigned int internal_count;
 	unsigned int component = 0;
 
+	if (aml_chip->mfr_type != NAND_MFR_MICRON || aml_chip->ran_mode)
+		return -EINVAL;
 	if (!mtd->writesize || !mtd->erasesize ||
 	    (mtd->erasesize % mtd->writesize))
 		return -EINVAL;
@@ -7000,7 +7049,7 @@ static int g336_prepare_geometry(struct g336_scan_state *scan)
 		for (internal = 0; internal < internal_count;
 		     internal++) {
 			for (plane = 0; plane < aml_chip->plane_num; plane++) {
-				if (component >= G336_MAX_COMPONENTS)
+				if (component >= G337_MAX_COMPONENTS)
 					return -E2BIG;
 				scan->component_chip[component] = chip;
 				scan->component_internal[component] = internal;
@@ -7010,17 +7059,31 @@ static int g336_prepare_geometry(struct g336_scan_state *scan)
 		}
 	}
 
-	if (!component || !mtd->oobavail || (mtd->oobavail % component))
+	if (!component || !aml_chip->page_size || !aml_chip->oob_size ||
+	    !aml_chip->block_size)
 		return -EINVAL;
-	scan->segment_bytes = mtd->oobavail / component;
-	if (!scan->segment_bytes || scan->segment_bytes > 32)
-		return -E2BIG;
+	if (component != G337_EXPECTED_COMPONENTS ||
+	    aml_chip->page_size != G337_PHYSICAL_PAGE_BYTES ||
+	    aml_chip->oob_size != G337_PHYSICAL_OOB_BYTES ||
+	    aml_chip->block_size != G337_PHYSICAL_ERASE_BYTES)
+		return -EINVAL;
+	if (component * aml_chip->page_size != mtd->writesize ||
+	    component * aml_chip->oob_size != mtd->oobsize ||
+	    component * aml_chip->block_size != mtd->erasesize)
+		return -EINVAL;
+	scan->segment_bytes = aml_chip->oob_size;
+	scan->oob_bytes = mtd->oobsize;
+	scan->raw_page_bytes = mtd->writesize + mtd->oobsize;
+	scan->physical_page_bytes = aml_chip->page_size;
+	scan->physical_erase_bytes = aml_chip->block_size;
+	if (scan->raw_page_bytes != component *
+			(scan->physical_page_bytes + scan->segment_bytes))
+		return -EINVAL;
 	scan->marker_pos = aml_chip->chip.badblockpos;
 	if (scan->marker_pos >= scan->segment_bytes)
 		return -EINVAL;
 
 	scan->component_count = component;
-	scan->oob_bytes = mtd->oobavail;
 	scan->pages_per_block = mtd->erasesize / mtd->writesize;
 	scan->total_blocks = div_u64(mtd->size, mtd->erasesize);
 	if (!scan->total_blocks)
@@ -7028,34 +7091,50 @@ static int g336_prepare_geometry(struct g336_scan_state *scan)
 	return 0;
 }
 
-static int g336_scan_nand(struct g336_scan_state *scan)
+static void g337_extract_raw_oob(const struct g337_scan_state *scan,
+				 u8 *oob, const u8 *raw)
+{
+	unsigned int component;
+	unsigned int stride = scan->physical_page_bytes + scan->segment_bytes;
+
+	for (component = 0; component < scan->component_count; component++)
+		memcpy(oob + component * scan->segment_bytes,
+		       raw + component * stride + scan->physical_page_bytes,
+		       scan->segment_bytes);
+}
+
+static int g337_scan_nand(struct g337_scan_state *scan)
 {
 	struct aml_nand_chip *aml_chip = scan->aml_chip;
 	struct mtd_info *mtd = &aml_chip->mtd;
 	struct nand_chip *chip = mtd->priv;
 	struct mtd_oob_ops ops;
-	struct mtd_ecc_stats before;
-	struct g336_page_sample *sample;
-	u8 *oob, *verify_oob;
+	struct g337_page_sample *sample;
+	u8 *oob, *verify_oob, *raw, *verify_raw;
 	uint64_t ofs, addr;
 	unsigned int block, read_cnt, byte;
 	unsigned int block_marker_zero, block_marker_only;
 	unsigned int block_marker_nonff;
-	unsigned int block_segment_zero, block_vendor_bad;
+	unsigned int block_segment_zero, block_raw_all_zero;
 	unsigned int block_read_problem;
 	int error;
 
-	error = g336_prepare_geometry(scan);
+	error = g337_prepare_geometry(scan);
 	if (error)
 		return error;
 
 	scan->samples = vzalloc((size_t)scan->total_blocks *
-				 G336_SCAN_PAGES * sizeof(*scan->samples));
+				 G337_SCAN_PAGES * sizeof(*scan->samples));
 	scan->oob = vzalloc((size_t)scan->total_blocks *
-			     G336_SCAN_PAGES * scan->oob_bytes);
+			     G337_SCAN_PAGES * scan->oob_bytes);
 	scan->verify_oob = vzalloc((size_t)scan->total_blocks *
-				    G336_SCAN_PAGES * scan->oob_bytes);
-	if (!scan->samples || !scan->oob || !scan->verify_oob) {
+				    G337_SCAN_PAGES * scan->oob_bytes);
+	raw = vmalloc(scan->raw_page_bytes);
+	verify_raw = vmalloc(scan->raw_page_bytes);
+	if (!scan->samples || !scan->oob || !scan->verify_oob || !raw ||
+	    !verify_raw) {
+		vfree(verify_raw);
+		vfree(raw);
 		vfree(scan->verify_oob);
 		vfree(scan->oob);
 		vfree(scan->samples);
@@ -7065,103 +7144,104 @@ static int g336_scan_nand(struct g336_scan_state *scan)
 		return -ENOMEM;
 	}
 
-	printk(KERN_INFO "G336 scan: starting %u read-only physical blocks\n",
+	printk(KERN_INFO "G337 scan: starting %u raw read-only blocks\n",
 	       scan->total_blocks);
 	for (block = 0; block < scan->total_blocks; block++) {
 		if (!(block & 0x7f))
-			printk(KERN_INFO "G336 scan: block %u/%u\n", block,
+			printk(KERN_INFO "G337 scan: block %u/%u\n", block,
 			       scan->total_blocks);
 		block_marker_zero = 0;
 		block_marker_only = 0;
 		block_marker_nonff = 0;
 		block_segment_zero = 0;
-		block_vendor_bad = 0;
+		block_raw_all_zero = 0;
 		block_read_problem = 0;
 		ofs = (uint64_t)block * mtd->erasesize;
 
-		for (read_cnt = 0; read_cnt < G336_SCAN_PAGES; read_cnt++) {
-			sample = &scan->samples[g336_sample_index(scan, block,
+		for (read_cnt = 0; read_cnt < G337_SCAN_PAGES; read_cnt++) {
+			sample = &scan->samples[g337_sample_index(scan, block,
 									 read_cnt)];
-			oob = g336_sample_oob(scan, block, read_cnt);
-			verify_oob = g336_sample_verify_oob(scan, block,
+			oob = g337_sample_oob(scan, block, read_cnt);
+			verify_oob = g337_sample_verify_oob(scan, block,
 							       read_cnt);
-			/* Match the factory block-bad OOB-only read path. */
+			/* Read the full raw data+spare tuple with BCH disabled. */
+			memset(raw, 0xa5, scan->raw_page_bytes);
 			memset(oob, 0xa5, scan->oob_bytes);
 			memset(chip->oob_poi, 0xa5, scan->oob_bytes);
 			memset(&ops, 0, sizeof(ops));
-			ops.mode = MTD_OOB_AUTO;
-			ops.len = 0;
+			ops.mode = MTD_OOB_RAW;
+			ops.len = mtd->writesize;
 			ops.ooblen = scan->oob_bytes;
 			ops.ooboffs = 0;
-			ops.datbuf = NULL;
-			ops.oobbuf = oob;
+			ops.datbuf = raw;
+			ops.oobbuf = NULL;
 			chip->pagebuf = -1;
-			before = mtd->ecc_stats;
 			addr = ofs + (scan->pages_per_block - 1) * read_cnt *
 				       mtd->writesize;
+			g337_raw_probe_fill = 0xa5;
+			g337_raw_probe_dma_error_mask = 0;
+			g337_raw_probe_chip = aml_chip;
+			g337_raw_probe_buffer = raw;
+			g337_raw_probe_active = 1;
 			error = mtd->read_oob(mtd, addr, &ops);
+			g337_raw_probe_active = 0;
+			g337_raw_probe_buffer = NULL;
+			g337_raw_probe_chip = NULL;
 			sample->error = error;
 			sample->retlen = ops.retlen;
-			sample->oobretlen = ops.oobretlen;
-			sample->captured = ops.oobretlen == scan->oob_bytes;
-			sample->ecc_failed = mtd->ecc_stats.failed - before.failed;
-			sample->ecc_corrected = mtd->ecc_stats.corrected -
-						before.corrected;
+			sample->dma_error_mask = g337_raw_probe_dma_error_mask;
+			g337_extract_raw_oob(scan, oob, raw);
 
 			/*
-			 * Repeat with the inverse fill.  Equal results prove that all
-			 * returned bytes came from NAND rather than stale RAM.
+			 * Repeat with the inverse fill.  Equal raw spare proves that
+			 * every byte came from NAND rather than stale DMA memory.
 			 */
+			memset(verify_raw, 0x5a, scan->raw_page_bytes);
 			memset(verify_oob, 0x5a, scan->oob_bytes);
 			memset(chip->oob_poi, 0x5a, scan->oob_bytes);
 			memset(&ops, 0, sizeof(ops));
-			ops.mode = MTD_OOB_AUTO;
-			ops.len = 0;
+			ops.mode = MTD_OOB_RAW;
+			ops.len = mtd->writesize;
 			ops.ooblen = scan->oob_bytes;
 			ops.ooboffs = 0;
-			ops.datbuf = NULL;
-			ops.oobbuf = verify_oob;
+			ops.datbuf = verify_raw;
+			ops.oobbuf = NULL;
 			chip->pagebuf = -1;
-			before = mtd->ecc_stats;
+			g337_raw_probe_fill = 0x5a;
+			g337_raw_probe_dma_error_mask = 0;
+			g337_raw_probe_chip = aml_chip;
+			g337_raw_probe_buffer = verify_raw;
+			g337_raw_probe_active = 1;
 			sample->verify_error = mtd->read_oob(mtd, addr, &ops);
-			sample->verify_oobretlen = ops.oobretlen;
-			sample->verify_ecc_failed = mtd->ecc_stats.failed -
-						       before.failed;
-			sample->verify_ecc_corrected = mtd->ecc_stats.corrected -
-							  before.corrected;
+			g337_raw_probe_active = 0;
+			g337_raw_probe_buffer = NULL;
+			g337_raw_probe_chip = NULL;
+			sample->verify_retlen = ops.retlen;
+			sample->verify_dma_error_mask =
+				g337_raw_probe_dma_error_mask;
+			g337_extract_raw_oob(scan, verify_oob, verify_raw);
 			for (byte = 0; byte < scan->oob_bytes; byte++) {
 				if (oob[byte] != verify_oob[byte])
 					sample->mismatch_bytes++;
 			}
-			sample->captured =
-				sample->oobretlen == scan->oob_bytes &&
-				sample->verify_oobretlen == scan->oob_bytes;
+			sample->captured = sample->retlen == mtd->writesize &&
+				sample->verify_retlen == mtd->writesize;
 			sample->stable = sample->captured &&
 					 !sample->mismatch_bytes;
 
 			scan->reads += 2;
-			if (sample->stable) {
-				g336_classify_page(scan, sample, oob);
-				block_marker_zero |= sample->marker_zero_mask;
-				block_marker_nonff |= sample->marker_nonff_mask;
-				block_marker_only |= sample->marker_only_mask;
-				block_segment_zero |= sample->segment_zero_mask;
-			}
-			if (error == -EUCLEAN)
-				scan->euclean_reads++;
-			if (sample->verify_error == -EUCLEAN)
-				scan->euclean_reads++;
-			if (sample->ecc_failed || sample->verify_ecc_failed) {
-				scan->ecc_failed_reads++;
+			if (sample->dma_error_mask ||
+			    sample->verify_dma_error_mask) {
+				scan->dma_error_reads++;
 				block_read_problem = 1;
 			}
 			if (!sample->stable) {
 				scan->unstable_reads++;
 				block_read_problem = 1;
 			}
-			if (((error != 0) && (error != -EUCLEAN)) ||
-			    ((sample->verify_error != 0) &&
-			     (sample->verify_error != -EUCLEAN)) ||
+			if (error || sample->verify_error ||
+			    sample->dma_error_mask ||
+			    sample->verify_dma_error_mask ||
 			    !sample->captured || !sample->stable) {
 				scan->read_errors++;
 				block_read_problem = 1;
@@ -7169,7 +7249,12 @@ static int g336_scan_nand(struct g336_scan_state *scan)
 			}
 
 			sample->valid = 1;
-			block_vendor_bad |= sample->vendor_all_zero;
+			g337_classify_page(scan, sample, oob);
+			block_marker_zero |= sample->marker_zero_mask;
+			block_marker_nonff |= sample->marker_nonff_mask;
+			block_marker_only |= sample->marker_only_mask;
+			block_segment_zero |= sample->segment_zero_mask;
+			block_raw_all_zero |= sample->raw_all_zero;
 		}
 
 		if (block_marker_zero)
@@ -7180,106 +7265,115 @@ static int g336_scan_nand(struct g336_scan_state *scan)
 			scan->marker_only_blocks++;
 		if (block_segment_zero)
 			scan->component_zero_blocks++;
-		if (block_vendor_bad)
-			scan->vendor_bad_blocks++;
+		if (block_raw_all_zero)
+			scan->raw_all_zero_blocks++;
 		if (block_marker_nonff || block_read_problem)
 			scan->review_blocks++;
 	}
 
 	printk(KERN_INFO
-	       "G336 scan: complete reads=%u errors=%u unstable=%u review_blocks=%u\n",
-	       scan->reads, scan->read_errors, scan->unstable_reads,
+	       "G337 scan: complete reads=%u errors=%u dma_errors=%u unstable=%u review_blocks=%u\n",
+	       scan->reads, scan->read_errors, scan->dma_error_reads,
+	       scan->unstable_reads,
 	       scan->review_blocks);
+	vfree(verify_raw);
+	vfree(raw);
 	return 0;
 }
 
-static int g336_block_needs_review(const struct g336_scan_state *scan,
+static int g337_block_needs_review(const struct g337_scan_state *scan,
 				   unsigned int block)
 {
-	const struct g336_page_sample *first;
-	const struct g336_page_sample *last;
+	const struct g337_page_sample *first;
+	const struct g337_page_sample *last;
 
-	first = &scan->samples[g336_sample_index(scan, block, 0)];
-	last = &scan->samples[g336_sample_index(scan, block, 1)];
+	first = &scan->samples[g337_sample_index(scan, block, 0)];
+	last = &scan->samples[g337_sample_index(scan, block, 1)];
 	return !first->valid || !last->valid || !first->stable ||
-		!last->stable || first->ecc_failed || last->ecc_failed ||
-		first->verify_ecc_failed || last->verify_ecc_failed ||
+		!last->stable || first->dma_error_mask ||
+		last->dma_error_mask || first->verify_dma_error_mask ||
+		last->verify_dma_error_mask ||
 		first->marker_nonff_mask ||
 		last->marker_nonff_mask;
 }
 
-static void g336_print_component(struct seq_file *seq,
-				 const struct g336_scan_state *scan,
+static void g337_print_component(struct seq_file *seq,
+				 const struct g337_scan_state *scan,
 				 const char *sample_name, const u8 *oob,
 				 unsigned int component)
 {
 	const u8 *segment = oob + component * scan->segment_bytes;
-	u32 zero_mask = 0;
-	u32 ff_mask = 0;
+	u32 raw_crc;
+	unsigned int zero_count = 0;
+	unsigned int ff_count = 0;
 	unsigned int byte;
 
 	for (byte = 0; byte < scan->segment_bytes; byte++) {
 		if (segment[byte] == 0)
-			zero_mask |= 1U << byte;
+			zero_count++;
 		if (segment[byte] == 0xff)
-			ff_mask |= 1U << byte;
+			ff_count++;
 	}
+	raw_crc = crc32((0 ^ 0xffffffffL), segment,
+			scan->segment_bytes) ^ 0xffffffffL;
 	seq_printf(seq,
 		   "sample=%s component=%u chip=%u internal=%u plane=%u marker=%02x "
-		   "zero_mask=0x%08x ff_mask=0x%08x oob=",
+		   "zero_count=%u ff_count=%u raw_crc32=%08x raw_oob=",
 		   sample_name, component, scan->component_chip[component],
 		   scan->component_internal[component],
 		   scan->component_plane[component], segment[scan->marker_pos],
-		   zero_mask, ff_mask);
+		   zero_count, ff_count, raw_crc);
 	for (byte = 0; byte < scan->segment_bytes; byte++)
 		seq_printf(seq, "%02x", segment[byte]);
 	seq_putc(seq, '\n');
 }
 
-static int g336_physical_bbt_show(struct seq_file *seq, void *item)
+static int g337_physical_bbt_show(struct seq_file *seq, void *item)
 {
-	struct g336_scan_state *scan = seq->private;
+	struct g337_scan_state *scan = seq->private;
 	struct aml_nand_chip *aml_chip = scan->aml_chip;
 	struct mtd_info *mtd = &aml_chip->mtd;
-	struct g336_page_sample *sample;
+	struct g337_page_sample *sample;
 	unsigned int block, read_cnt, component;
 	u8 *oob, *verify_oob;
 	uint64_t addr;
 
 	if (item == SEQ_START_TOKEN) {
 		seq_printf(seq,
-			"g336=read_only scan=complete read_path=mtd_oob_only_auto "
-			"verification=dual_read_inverse_fill "
-			"classification=vendor_3.0.101_plus_physical_segments\n"
+			"g337=read_only scan=complete read_path=mtd_raw_bch0_page "
+			"verification=dual_read_inverse_fill_full_spare "
+			"classification=physical_raw_marker_byte\n"
 			"total_blocks=%u reads=%u pages_per_block=%u "
 			"virtual_page=0x%x virtual_erase=0x%x "
 			"physical_page=0x%x physical_erase=0x%x\n"
 			"configured_chips=%u valid_chips=%u valid_chip_mask=0x%x "
-			"planes=%u internal_chips=%u "
+			"planes=%u internal_chips=%u mfr_type=0x%x ran_mode=%u "
 			"components=%u component_order=chip_internal_plane "
-			"oob_bytes=%u segment_bytes=%u badblockpos=%d\n"
-			"summary read_errors=%u unstable_reads=%u "
-			"euclean_reads=%u ecc_failed_reads=%u "
+			"raw_page_bytes=%u raw_oob_bytes=%u "
+			"raw_segment_bytes=%u badblockpos=%d\n"
+			"summary read_errors=%u dma_error_reads=%u "
+			"unstable_reads=%u "
 			"marker_zero_blocks=%u marker_nonff_blocks=%u "
 			"marker_only_blocks=%u "
-			"component_zero_blocks=%u vendor_bad_blocks=%u "
+			"component_zero_blocks=%u raw_all_zero_blocks=%u "
 			"review_blocks=%u\n"
-			"policy vendor_reference_bad=all_relevant_oob_zero "
-			"candidate=deferred review=marker_nonff_or_read_problem "
+			"policy raw_marker_nonff=candidate_for_offline_review "
+			"candidate=deferred no_automatic_classification=1 "
 			"no_bbt_write=1\n",
 			scan->total_blocks, scan->reads, scan->pages_per_block,
 			mtd->writesize, mtd->erasesize, aml_chip->page_size,
 			aml_chip->block_size, aml_chip->chip_num,
 			scan->valid_chip_count, scan->valid_chip_mask,
 			aml_chip->plane_num,
-			scan->internal_count, scan->component_count,
-			scan->oob_bytes, scan->segment_bytes,
+			scan->internal_count, aml_chip->mfr_type,
+			aml_chip->ran_mode, scan->component_count,
+			scan->raw_page_bytes, scan->oob_bytes,
+			scan->segment_bytes,
 			aml_chip->chip.badblockpos, scan->read_errors,
-			scan->unstable_reads,
-			scan->euclean_reads, scan->ecc_failed_reads,
+			scan->dma_error_reads, scan->unstable_reads,
 			scan->marker_zero_blocks, scan->marker_nonff_blocks,
 			scan->marker_only_blocks,
-			scan->component_zero_blocks, scan->vendor_bad_blocks,
+			scan->component_zero_blocks, scan->raw_all_zero_blocks,
 			scan->review_blocks);
 		for (component = 0; component < scan->component_count;
 		     component++)
@@ -7292,104 +7386,102 @@ static int g336_physical_bbt_show(struct seq_file *seq, void *item)
 	}
 
 	sample = item;
-	block = (sample - scan->samples) / G336_SCAN_PAGES;
-	if (!g336_block_needs_review(scan, block))
+	block = (sample - scan->samples) / G337_SCAN_PAGES;
+	if (!g337_block_needs_review(scan, block))
 		return 0;
 
 	seq_printf(seq, "review_block=%u addr=0x%llx proposed_factory_entry=none\n",
 		   block, (unsigned long long)block * mtd->erasesize);
-	for (read_cnt = 0; read_cnt < G336_SCAN_PAGES; read_cnt++) {
-		sample = &scan->samples[g336_sample_index(scan, block,
+	for (read_cnt = 0; read_cnt < G337_SCAN_PAGES; read_cnt++) {
+		sample = &scan->samples[g337_sample_index(scan, block,
 								 read_cnt)];
-		oob = g336_sample_oob(scan, block, read_cnt);
-		verify_oob = g336_sample_verify_oob(scan, block, read_cnt);
+		oob = g337_sample_oob(scan, block, read_cnt);
+		verify_oob = g337_sample_verify_oob(scan, block, read_cnt);
 		addr = (uint64_t)block * mtd->erasesize +
 		       (scan->pages_per_block - 1) * read_cnt * mtd->writesize;
 		seq_printf(seq,
 			   "page=%s page_index=%u addr=0x%llx valid=%u captured=%u "
-			   "stable=%u mismatch_bytes=%u error=%d retlen=%u oobretlen=%u "
-			   "verify_error=%d verify_oobretlen=%u "
-			   "ecc_failed=%u ecc_corrected=%u verify_ecc_failed=%u "
-			   "verify_ecc_corrected=%u "
+			   "stable=%u mismatch_bytes=%u error=%d retlen=%u "
+			   "dma_error_mask=0x%08x verify_error=%d verify_retlen=%u "
+			   "verify_dma_error_mask=0x%08x "
 			   "marker_zero_mask=0x%08x marker_nonff_mask=0x%08x "
 			   "marker_only_mask=0x%08x segment_zero_mask=0x%08x "
-			   "segment_ff_mask=0x%08x vendor_all_zero=%u\n",
+			   "segment_ff_mask=0x%08x raw_all_zero=%u\n",
 			   read_cnt ? "last" : "first",
 			   read_cnt ? scan->pages_per_block - 1 : 0,
 			   (unsigned long long)addr, sample->valid, sample->captured,
 			   sample->stable, sample->mismatch_bytes, sample->error,
-			   sample->retlen, sample->oobretlen, sample->verify_error,
-			   sample->verify_oobretlen, sample->ecc_failed,
-			   sample->ecc_corrected, sample->verify_ecc_failed,
-			   sample->verify_ecc_corrected,
+			   sample->retlen, sample->dma_error_mask,
+			   sample->verify_error, sample->verify_retlen,
+			   sample->verify_dma_error_mask,
 			   sample->marker_zero_mask, sample->marker_nonff_mask,
 			   sample->marker_only_mask, sample->segment_zero_mask,
-			   sample->segment_ff_mask, sample->vendor_all_zero);
-		if (!sample->captured)
-			continue;
+			   sample->segment_ff_mask, sample->raw_all_zero);
 		for (component = 0; component < scan->component_count;
 		     component++)
-			g336_print_component(seq, scan, "primary", oob, component);
+			g337_print_component(seq, scan, "primary", oob, component);
 		if (!sample->stable) {
 			for (component = 0; component < scan->component_count;
 			     component++)
-				g336_print_component(seq, scan, "verify", verify_oob,
+				g337_print_component(seq, scan, "verify", verify_oob,
 						     component);
 		}
 	}
 	return 0;
 }
 
-static void *g336_physical_bbt_start(struct seq_file *seq, loff_t *pos)
+static void *g337_physical_bbt_start(struct seq_file *seq, loff_t *pos)
 {
-	struct g336_scan_state *scan = seq->private;
+	struct g337_scan_state *scan = seq->private;
 
 	if (*pos == 0)
 		return SEQ_START_TOKEN;
 	if (*pos > scan->total_blocks)
 		return NULL;
-	return &scan->samples[(*pos - 1) * G336_SCAN_PAGES];
+	return &scan->samples[(*pos - 1) * G337_SCAN_PAGES];
 }
 
-static void *g336_physical_bbt_next(struct seq_file *seq, void *item,
+static void *g337_physical_bbt_next(struct seq_file *seq, void *item,
 				    loff_t *pos)
 {
-	struct g336_scan_state *scan = seq->private;
+	struct g337_scan_state *scan = seq->private;
 
 	(void)item;
 	(*pos)++;
 	if (*pos > scan->total_blocks)
 		return NULL;
-	return &scan->samples[(*pos - 1) * G336_SCAN_PAGES];
+	return &scan->samples[(*pos - 1) * G337_SCAN_PAGES];
 }
 
-static void g336_physical_bbt_stop(struct seq_file *seq, void *item)
+static void g337_physical_bbt_stop(struct seq_file *seq, void *item)
 {
 	(void)seq;
 	(void)item;
 }
 
-static const struct seq_operations g336_physical_bbt_seq_ops = {
-	.start = g336_physical_bbt_start,
-	.next = g336_physical_bbt_next,
-	.stop = g336_physical_bbt_stop,
-	.show = g336_physical_bbt_show,
+static const struct seq_operations g337_physical_bbt_seq_ops = {
+	.start = g337_physical_bbt_start,
+	.next = g337_physical_bbt_next,
+	.stop = g337_physical_bbt_stop,
+	.show = g337_physical_bbt_show,
 };
 
-static int g336_physical_bbt_open(struct inode *inode, struct file *file)
+static int g337_physical_bbt_open(struct inode *inode, struct file *file)
 {
-	struct g336_scan_state *scan;
+	struct g337_scan_state *scan;
 	struct seq_file *seq;
 	int error;
 
+	if (atomic_cmpxchg(&g337_scan_open, 0, 1))
+		return -EBUSY;
 	scan = kzalloc(sizeof(*scan), GFP_KERNEL);
 	if (!scan)
-		return -ENOMEM;
+		goto clear_open;
 	scan->aml_chip = PDE(inode)->data;
-	error = g336_scan_nand(scan);
+	error = g337_scan_nand(scan);
 	if (error)
 		goto free_scan;
-	error = seq_open(file, &g336_physical_bbt_seq_ops);
+	error = seq_open(file, &g337_physical_bbt_seq_ops);
 	if (error)
 		goto free_scan;
 	seq = file->private_data;
@@ -7401,27 +7493,33 @@ free_scan:
 	vfree(scan->oob);
 	vfree(scan->samples);
 	kfree(scan);
+	atomic_set(&g337_scan_open, 0);
 	return error;
+
+clear_open:
+	atomic_set(&g337_scan_open, 0);
+	return -ENOMEM;
 }
 
-static int g336_physical_bbt_release(struct inode *inode, struct file *file)
+static int g337_physical_bbt_release(struct inode *inode, struct file *file)
 {
 	struct seq_file *seq = file->private_data;
-	struct g336_scan_state *scan = seq->private;
+	struct g337_scan_state *scan = seq->private;
 
 	vfree(scan->verify_oob);
 	vfree(scan->oob);
 	vfree(scan->samples);
 	kfree(scan);
+	atomic_set(&g337_scan_open, 0);
 	return seq_release(inode, file);
 }
 
-static const struct file_operations g336_physical_bbt_fops = {
+static const struct file_operations g337_physical_bbt_fops = {
 	.owner = THIS_MODULE,
-	.open = g336_physical_bbt_open,
+	.open = g337_physical_bbt_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
-	.release = g336_physical_bbt_release,
+	.release = g337_physical_bbt_release,
 };
 
 int aml_nand_init(struct aml_nand_chip *aml_chip)
@@ -8044,13 +8142,13 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 		err = class_register(&aml_chip->cls);
 		if (err)
 			printk(" class register nand_class fail!\n");
-		if (!proc_create_data("g336_physical_bbt", S_IRUGO, NULL,
-				      &g336_physical_bbt_fops, aml_chip))
+		if (!proc_create_data("g337_physical_bbt", S_IRUGO, NULL,
+				      &g337_physical_bbt_fops, aml_chip))
 			printk(KERN_ERR
-				"G336 rescue: failed to create OOB-only BBT diagnostic\n");
+				"G337 rescue: failed to create raw OOB BBT diagnostic\n");
 		else
 			printk(KERN_INFO
-				"G336 rescue: read-only OOB-only BBT diagnostic ready\n");
+				"G337 rescue: read-only raw OOB/BCH0 BBT diagnostic ready\n");
 	}
 
 	if (aml_nand_add_partition(aml_chip) != 0) {

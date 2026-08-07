@@ -188,6 +188,65 @@ static struct g343_gate g343_gate = {
 	.armed = ATOMIC_INIT(0),
 };
 
+static u32 g343_crc(const void *data, size_t size);
+static int g343_read_page(struct g343_state *state, unsigned int page,
+				  u8 *data, struct env_oobinfo_t *oob);
+static int g343_validate_source_record(struct g343_state *state, env_t *env);
+static int g343_validate_source_oob(const struct env_oobinfo_t *oob);
+static void g343_build_new_record(struct g343_state *state);
+
+int g343_env_restore_current(void)
+{
+	struct g343_state *state = g343_singleton;
+	env_t *env;
+	unsigned int data_size;
+	u32 bbt_crc;
+	int error;
+
+	if (!state)
+		return 0;
+	mutex_lock(&state->lock);
+	error = g343_read_page(state, G343_SOURCE_PAGE,
+				state->old1, &state->old1_oob);
+	if (error || g343_validate_source_oob(&state->old1_oob) ||
+	    g343_validate_source_record(state, (env_t *)state->old1)) {
+		error = error ? error : -EINVAL;
+		goto out;
+	}
+	g343_build_new_record(state);
+	error = g343_read_page(state, G343_TARGET_PAGE,
+					state->verify, &state->verify_oob);
+	if (error)
+		goto out;
+	error = g343_read_page(state, G343_TARGET_PAGE,
+					state->empty0, &state->empty0_oob);
+	if (error)
+		goto out;
+	env = (env_t *)state->verify;
+	data_size = sizeof(env->data);
+	bbt_crc = g343_crc(env->data + G343_ENV_PREFIX_SIZE,
+			   sizeof(struct aml_nand_bbt_info));
+	if (g343_crc(env->data, data_size) != env->crc ||
+	    g343_crc(state->verify, state->mtd->writesize) !=
+		G343_NEW_RECORD_CRC ||
+	    env->crc != G343_NEW_OUTER_CRC ||
+	    bbt_crc != G343_NEW_BBT_CRC ||
+	    memcmp(state->verify, state->empty0, state->mtd->writesize) ||
+	    memcmp(&state->verify_oob, &state->empty0_oob,
+		   sizeof(state->verify_oob)) ||
+	    memcmp(state->verify, state->new_record, state->mtd->writesize) ||
+	    memcmp(&state->verify_oob, &state->new_oob,
+		   sizeof(state->new_oob))) {
+		error = -EINVAL;
+		goto out;
+	}
+	state->success = 1;
+	error = 0;
+out:
+	mutex_unlock(&state->lock);
+	return !error;
+}
+
 static u32 g343_crc(const void *data, size_t size)
 {
 	return crc32((0 ^ 0xffffffffL), data, size) ^ 0xffffffffL;

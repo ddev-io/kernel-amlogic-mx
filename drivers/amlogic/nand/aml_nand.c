@@ -31,6 +31,7 @@
 #include "g339_service_bbt.h"
 #include "g341_ecc_health.h"
 #include "g343_bbt_restore.h"
+#include "g347_logo_restore.h"
 /*
  * CONFIG_SYS_NAND_RESET_CNT is used as a timeout mechanism when resetting
  * a flash.  NAND flash is initialized prior to interrupts so standard timers
@@ -3376,19 +3377,29 @@ exit:
 static int aml_nand_write_page(struct mtd_info *mtd, struct nand_chip *chip, const uint8_t *buf, int page, int cached, int raw)
 {
 	int status;
+	int env_write;
+	int logo_write;
 	struct aml_nand_chip *aml_chip = mtd_to_nand_chip(mtd);
 
-	if (!g343_bbt_write_gate_take(mtd, buf, chip->oob_poi, page,
-					 cached, raw)) {
+	env_write = g343_bbt_write_gate_take(mtd, buf, chip->oob_poi, page,
+					    cached, raw);
+	logo_write = 0;
+	if (!env_write)
+		logo_write = g347_logo_write_gate_take(mtd, buf, chip->oob_poi,
+							 page, cached, raw);
+	if (!env_write && !logo_write) {
 		printk(KERN_WARNING
-			"G346 rescue: low-level NAND page write blocked at page %d\n",
+			"G347 rescue: low-level NAND page write blocked at page %d\n",
 			page);
 		return -EPERM;
 	}
-	printk(KERN_WARNING
-		"G346 rescue: one-shot environment journal page write accepted "
-		"at page %d\n",
-		page);
+	if (env_write)
+		printk(KERN_WARNING
+		       "G346 rescue: one-shot environment journal page write "
+		       "accepted at page %d\n", page);
+	else
+		printk(KERN_WARNING
+		       "G347 rescue: guarded logo page %d accepted\n", page);
 
 	chip->cmdfunc(mtd, NAND_CMD_SEQIN, 0x00, page);
 
@@ -8133,10 +8144,11 @@ int aml_nand_init(struct aml_nand_chip *aml_chip)
 			printk(KERN_INFO
 				"G336 rescue: read-only OOB-only BBT diagnostic ready\n");
 		g339_service_bbt_register(aml_chip);
-		printk(KERN_INFO
-			"G342 rescue: verified G341 full ECC rescan disabled\n");
-		g343_bbt_restore_register(aml_chip);
-	}
+			printk(KERN_INFO
+				"G342 rescue: verified G341 full ECC rescan disabled\n");
+			g343_bbt_restore_register(aml_chip);
+			g347_logo_restore_register(aml_chip);
+		}
 
 	if (aml_nand_add_partition(aml_chip) != 0) {
 		err = -ENXIO;
